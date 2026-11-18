@@ -241,10 +241,10 @@ body { display: grid; place-items: center; }
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-  max-width: 46%;
+  max-width: min(46%, calc(100% - 268px));
 }
 .speed-bar button {
-  min-width: 44px;
+  min-width: 0;
   min-height: 36px;
   padding: 0 8px;
   border-radius: 9px;
@@ -321,23 +321,25 @@ body { display: grid; place-items: center; }
 
 .broadcast-bar {
   position: absolute;
-  left: 50%;
-  bottom: 2.6%;
-  transform: translateX(-50%);
+  left: 18.6%;
+  right: 18.6%;
+  bottom: 2.2%;
+  transform: none;
   z-index: 4;
-  width: 46%;
-  max-width: 640px;
+  width: auto;
+  max-width: none;
   background: linear-gradient(180deg, #ffe56a, #f1c40f 55%, #e0b000);
   color: #1c1404;
   font-weight: 800;
-  font-size: clamp(11px, 1.7vh, 15px);
+  font-size: clamp(9px, 1.65vh, 15px);
+  line-height: 1.25;
   text-align: center;
-  padding: 0.45em 0.9em;
+  padding: 0.42em 0.7em;
   border-radius: 7px;
   box-shadow: 0 6px 16px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.55);
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
+  text-overflow: clip;
 }
 
 .ctrl-bar {
@@ -346,7 +348,10 @@ body { display: grid; place-items: center; }
   right: 1.2%;
   z-index: 5;
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 5px;
+  max-width: min(46%, calc(100% - 8px));
 }
 .ctrl-bar button {
   width: 46px;
@@ -383,15 +388,31 @@ body { display: grid; place-items: center; }
   .score { font-size: 20px; }
   .tname { max-width: 72px; overflow: hidden; text-overflow: ellipsis; }
   .team { min-width: 0; }
-  .hud { top: 46px; padding: 0.3em 0.55em; gap: 6px; max-width: calc(100% - 16px); }
-  .speed-bar { top: 6px; left: 6px; max-width: calc(100% - 250px); }
-  .speed-bar button { min-height: 32px; font-size: 10px; padding: 0 6px; }
-  .ctrl-bar { top: 6px; right: 6px; gap: 4px; }
-  .ctrl-bar button { width: 42px; height: 36px; }
-  .pa-banner { top: 108px; max-width: 48%; }
-  .lineup-panel { top: 118px; bottom: 58px; width: 21%; padding: 4px; }
-  .broadcast-bar { bottom: 8px; width: min(54%, 420px); left: 8px; transform: none; }
-  .alert-banner { top: 118px; }
+  .hud { top: 46px; left: 8px; right: 8px; transform: none; padding: 0.3em 0.55em; gap: 6px; max-width: none; width: auto; }
+  .speed-bar { top: 6px; left: 6px; max-width: calc(58% - 8px); }
+  .speed-bar button { min-height: 30px; font-size: 10px; padding: 0 6px; }
+  #btnSim { min-width: 0; }
+  .ctrl-bar { top: 6px; right: 6px; gap: 3px; max-width: calc(42% - 4px); }
+  .ctrl-bar button { width: 36px; height: 32px; }
+  .ctrl-bar button .cap { font-size: 8px; }
+  .pa-banner { top: 108px; max-width: min(52%, calc(100% - 8px)); }
+  .lineup-panel { top: 118px; bottom: 46px; width: 22%; max-width: 168px; padding: 4px; }
+  .lineup-panel.away { left: 4px; }
+  .lineup-panel.home { right: 4px; }
+  .broadcast-bar { left: 23%; right: 23%; bottom: 6px; width: auto; }
+  .alert-banner { top: 118px; max-width: calc(100% - 16px); }
+}
+@media (max-width: 640px) {
+  .hud { top: 70px; }
+  .speed-bar { max-width: calc(100% - 12px); }
+  .ctrl-bar { top: 38px; max-width: calc(100% - 12px); }
+  .pa-banner { top: 128px; }
+  .lineup-panel { top: 146px; width: 30%; max-width: none; }
+  .lineup-panel.away { left: 3px; }
+  .lineup-panel.home { right: 3px; }
+  .pitcher-info { font-size: 9px; }
+  .batter-row { font-size: 9px; }
+  .broadcast-bar { left: 31%; right: 31%; font-size: clamp(8px, 2.4vw, 13px); }
 }
 @media (max-width: 720px) {
   .lobby-main { flex-direction: column; }

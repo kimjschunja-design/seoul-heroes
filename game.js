@@ -146,7 +146,7 @@ const baseCoords = [{x:0,y:0}, {x:19.4,y:19.4}, {x:0,y:38.8}, {x:-19.4,y:19.4}, 
 const fieldPosMap = {
   'P': {x:0, y:18.4, of:false}, 'C': {x:0, y:-1.5, of:false},
   '1B': {x:18, y:26, of:false}, '2B': {x:9.5, y:36, of:false}, 'SS': {x:-9.5, y:36, of:false}, '3B': {x:-18, y:26, of:false},
-  'LF': {x:-52, y:81, of:true}, 'CF': {x:0, y:97, of:true}, 'RF': {x:52, y:81, of:true}
+  'LF': {x:-43.2, y:67.3, of:true}, 'CF': {x:0, y:84.5, of:true}, 'RF': {x:43.2, y:67.3, of:true}
 };
 let activeFielders = [];
 
@@ -234,6 +234,33 @@ function randNormal(mean, stdDev) {
   return mean + stdDev * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
+function setBroadcast(text) {
+  const el = document.getElementById('broadcastText');
+  if (!el || text == null) return;
+  el.textContent = text;
+  fitBroadcast(el);
+}
+function fitBroadcast(el) {
+  if (!el || !el.style) return;
+  const maxPx = 15;
+  const minPx = 8;
+  el.style.fontSize = maxPx + 'px';
+  if (!(el.clientWidth > 40) || !(el.scrollWidth > el.clientWidth + 1)) return;
+  let size = maxPx;
+  while (size > minPx && el.scrollWidth > el.clientWidth + 1) {
+    size = Math.round((size - 0.5) * 10) / 10;
+    el.style.fontSize = size + 'px';
+  }
+}
+function shownOuts() {
+  if (game && game._holdOuts) return Math.max(0, game.outs - (game._outsHeld || 0));
+  return game ? game.outs : 0;
+}
+function paintOuts() {
+  const dots = document.querySelectorAll('#outDisplay i');
+  const n = shownOuts();
+  for (let i = 0; i < dots.length; i++) dots[i].className = i < n ? 'on' : '';
+}
 function updateUI(msg) {
   document.getElementById('awayScore').textContent = game.away.score;
   document.getElementById('homeScore').textContent = game.home.score;
@@ -255,9 +282,8 @@ function updateUI(msg) {
   const arrow = document.getElementById('inningArrow');
   arrow.textContent = game.isOver ? '' : (game.isTop ? '▲' : '▼');
   arrow.className = 'arrow ' + (game.isTop ? 'top' : 'bot');
-  const dots = document.querySelectorAll('#outDisplay i');
-  for (let i = 0; i < dots.length; i++) dots[i].className = i < game.outs ? 'on' : '';
-  if (msg) document.getElementById('broadcastText').textContent = msg;
+  paintOuts();
+  if (msg) setBroadcast(msg);
   const windEl = document.getElementById('windChip');
   if (windEl && game.wind) windEl.textContent = game.wind.label;
   const mirrorBtn = document.getElementById('btnMirror');
@@ -1058,8 +1084,35 @@ function judgeInfieldHeight(shot) {
   }
   return { snag: null, jumpFail: jumpFail, over: over, skip: skip };
 }
-function cutoffSpot(ballX, ballY) {
-  return { x: ballX * 0.42, y: Math.max(30, Math.min(ballY * 0.48, 62)) };
+function bagPoint(key) {
+  if (key === '1B') return baseCoords[1];
+  if (key === '3B') return baseCoords[3];
+  if (key === 'HOME') return baseCoords[0];
+  return baseCoords[2];
+}
+function cutoffLateral(fld) {
+  const skill = Number(fld);
+  const f = isNaN(skill) ? 70 : skill;
+  if (f >= 90) return 0;
+  if (f <= 50) return 3.5;
+  if (f >= 70) return 1.8 * (90 - f) / 20;
+  return 1.8 + (3.5 - 1.8) * (70 - f) / 20;
+}
+function cutoffSpot(ballX, ballY, base, fld) {
+  const bx = base ? base.x : 0;
+  const by = base ? base.y : 38.8;
+  const dx = (ballX || 0) - bx;
+  const dy = (ballY || 0) - by;
+  const dist = Math.hypot(dx, dy) || 1;
+  const ahead = 12 + 3 * Math.max(0, Math.min(1, (dist - 60) / 40));
+  const reach = Math.min(ahead, Math.max(8, dist - 6));
+  const ux = dx / dist;
+  const uy = dy / dist;
+  const px = bx + ux * reach;
+  const py = by + uy * reach;
+  const lat = cutoffLateral(fld);
+  const side = (ballX || 0) >= 0 ? 1 : -1;
+  return { x: px - uy * lat * side, y: py + ux * lat * side };
 }
 function relayPair(x, chaser) {
   let cut = (x || 0) < 0 ? 'SS' : '2B';
@@ -1067,15 +1120,39 @@ function relayPair(x, chaser) {
   if (cut === chaser) { const swap = cut; cut = bag; bag = swap; }
   return { cut: cut, bag: bag };
 }
-function planRelay(who, x, y, release) {
+function planRelay(who, x, y, release, baseKey) {
   const pair = relayPair(x, who ? who.pos : '');
   const cut = fielderBy(pair.cut) || who;
-  const spot = cutoffSpot(x, y);
+  const spot = cutoffSpot(x, y, bagPoint(baseKey || '2B'), cut ? cut.fld : 70);
   const arm1 = armMetersPerSec(who ? who.fld : 70);
   const flight1 = Math.max(0.08, Math.hypot(spot.x - x, spot.y - y) / arm1);
   const cutRun = cut ? arriveTime(cut, spot.x, spot.y) : release + flight1;
   const rel2 = Math.max(release + flight1, cutRun) + 0.22;
   return { cut: cut, cutId: pair.cut, bagId: pair.bag, spot: spot, arm1: arm1, flight1: flight1, rel2: rel2 };
+}
+function directThrowTime(who, x, y, release, base) {
+  const arm = armMetersPerSec(who ? who.fld : 70);
+  return release + Math.hypot(base.x - x, base.y - y) / Math.max(1, arm);
+}
+function relayTotalTime(relay, base) {
+  const arm = armMetersPerSec(relay && relay.cut ? relay.cut.fld : 70);
+  return relay.rel2 + Math.hypot(base.x - relay.spot.x, base.y - relay.spot.y) / Math.max(1, arm);
+}
+function relayOrDirect(who, x, y, release, baseKey) {
+  const base = bagPoint(baseKey || '2B');
+  const direct = {
+    relay: null, baseKey: baseKey || '2B', x: x, y: y, rel: release,
+    fld: who ? who.fld : 70, t: directThrowTime(who, x, y, release, base)
+  };
+  if (!who || !who.isOF) return direct;
+  if (Math.hypot(base.x - x, base.y - y) <= 60) return direct;
+  const relay = planRelay(who, x, y, release, baseKey || '2B');
+  const cutT = relayTotalTime(relay, base);
+  if (direct.t <= cutT + 1e-9) return direct;
+  return {
+    relay: relay, baseKey: baseKey || '2B', x: relay.spot.x, y: relay.spot.y,
+    rel: relay.rel2, fld: relay.cut ? relay.cut.fld : direct.fld, t: cutT
+  };
 }
 function judgeCutoffHome(relay, runner, read) {
   const cut = relay && relay.cut;
@@ -1765,17 +1842,20 @@ function queueThrow(spec) {
     arc = { cx: 33, cy: 8 };
   } else if (to && BAG[to] && !wild) { x1 = BAG[to].x; y1 = BAG[to].y; }
   const toPos = spec.toPos || (to ? receiverFor(to, spec.from) : null);
-  const nearBag = spec.from === '1B' && to === '1B' && !wild && Math.hypot((spec.x0 || 0) - 19.4, (spec.y0 || 0) - 19.4) <= 11;
-  if (nearBag) {
+  const dist1 = Math.hypot((spec.x0 || 0) - 19.4, (spec.y0 || 0) - 19.4);
+  const carry = !!spec.carry || (spec.from === '1B' && to === '1B' && !wild && dist1 <= 6.5);
+  if (carry && spec.from === '1B' && to === '1B' && !wild) {
+    const fb = fielderBy('1B');
+    const runDur = spec.carry && spec.dur > 0 ? spec.dur : Math.max(1e-4, dist1 / Math.max(0.1, moveSpeed(fb || { spd: 70 })));
     if (game) { game._tag1 = true; game._coverP = false; game._needBag = '1B'; }
     throwPlan.push({
       carry: true, to: '1B', from: '1B', toPos: '1B', x0: spec.x0, y0: spec.y0, x1: 19.4, y1: 19.4,
-      needsCatch: spec.needsCatch !== false, release: spec.release, dur: spec.dur, arm: spec.arm, bounce: false
+      needsCatch: spec.needsCatch !== false, release: spec.release, dur: runDur, arm: spec.arm, bounce: false
     });
     return;
   }
   if (game && to === '1B' && !wild) {
-    if (spec.from === '1B') { game._coverP = true; game._tag1 = false; game._needBag = 'P'; }
+    if (spec.from === '1B' || spec.toPos === 'P') { game._coverP = true; game._tag1 = false; game._needBag = 'P'; }
     else game._needBag = '1B';
   }
   throwPlan.push({
@@ -1802,6 +1882,9 @@ function throwInAir(clock) {
 }
 function maybeCaption(clock) {
   if (!captionGate || captionGate.shown) return;
+  if (captionGate.mode === 'safe1' || captionGate.mode === 'after') {
+    if (throwPlan.length || throwInAir(clock)) return;
+  }
   if (captionGate.mode === 'safe1') {
     let safe = false;
     for (let i = 0; i < runnersAnim.length; i++) {
@@ -1809,8 +1892,6 @@ function maybeCaption(clock) {
       if (r.startIdx === 0 && r.curIdx >= 1) safe = true;
     }
     if (!safe) return;
-  } else if (captionGate.mode === 'after') {
-    if (throwPlan.length || throwInAir(clock)) return;
   }
   playCaption = { text: captionGate.text, bad: false };
   captionGate.shown = true;
@@ -1860,14 +1941,11 @@ function setGoals(chaserPos, tx, ty, mode) {
   const tag1 = game && game._tag1;
   const coverP = game && game._coverP;
   if (mode === 'ground' || mode === 'dp' || mode === 'home') {
-    if (coverP && mound) {
+    if (mound && !mound.isTarget && (coverP || chaserPos === '1B')) {
       stampCoverLag(mound);
-      mound.isTarget = true;
       mound.goalX = 19.4;
       mound.goalY = 19.4;
-    } else if (chaserPos === '1B' && !tag1 && mound && !mound.isTarget) {
-      stampCoverLag(mound);
-      mound.goalX = 19.4; mound.goalY = 19.4;
+      if (coverP) mound.isTarget = true;
     } else if (fb && !fb.isTarget && !tag1) {
       fb.goalX = 19.4; fb.goalY = 19.4;
     }
@@ -1895,24 +1973,23 @@ function setGoals(chaserPos, tx, ty, mode) {
       f.goalX = f.homeX * 0.78;
       f.goalY = f.homeY * 0.82;
     });
-  } else if (mode === 'relay2') {
-    const deep = Math.hypot(tx, ty) > OUTFIELD_GRASS_M;
-    if (deep) {
-      const pair = relayPair(tx, chaserPos);
-      const cutF = fielderBy(pair.cut);
-      const bagF = fielderBy(pair.bag);
-      const spot = cutoffSpot(tx, ty);
-      if (cutF && !cutF.isTarget) { cutF.goalX = spot.x; cutF.goalY = spot.y; }
-      if (bagF && !bagF.isTarget) { bagF.goalX = 0; bagF.goalY = 38.8; }
-    } else {
+  } else if (mode === 'relay2' || ((mode === 'fly' || mode === 'hit') && game && game._relay)) {
+    const relay = game && game._relay;
+    if (relay && relay.spot) {
+      const cutF = fielderBy(relay.cutId);
+      const bagKey = relay.baseKey || '2B';
+      const bag = bagPoint(bagKey);
+      const bagPos = bagKey === 'HOME' ? 'C' : (bagKey === '3B' ? '3B' : relay.bagId);
+      const bagF = fielderBy(bagPos);
+      if (cutF && !cutF.isTarget) { cutF.goalX = relay.spot.x; cutF.goalY = relay.spot.y; }
+      if (bagF && !bagF.isTarget) { bagF.goalX = bag.x; bagF.goalY = bag.y; }
+    } else if (mode === 'relay2') {
       const who = coverKeyForSecond(chaserPos, tx);
       const cover = fielderBy(who);
       if (cover && !cover.isTarget) { cover.goalX = 0; cover.goalY = 38.8; }
     }
     if (fb && !fb.isTarget) { fb.goalX = 16; fb.goalY = 22; }
   } else if (mode === 'fly' || mode === 'hit') {
-    const cut = tx < 0 ? ss : sb;
-    if (cut && !cut.isTarget) { cut.goalX = tx * 0.42; cut.goalY = Math.max(30, Math.min(ty * 0.48, 62)); }
     if (fb && !fb.isTarget) { fb.goalX = 16; fb.goalY = 24; }
     if (tb && !tb.isTarget) { tb.goalX = -16; tb.goalY = 22; }
     ['LF', 'CF', 'RF'].forEach(function (pos) {
@@ -2045,7 +2122,7 @@ function placeBall(t) {
 }
 const HALFWAY_M = JUDGE_BASE_M / 3;
 const OVERRUN_M = 2.5;
-const PASS_GAP_M = 2.5;
+const PASS_GAP_M = 3.5;
 const ROUND_BULGE = 2.4;
 const OVERRUN_LOOK = 0.32;
 const TAG_ACT = 0.12;
@@ -2061,6 +2138,14 @@ function dynamicLead(runner, pit) {
   if (lead < 4.2) lead = 4.2;
   if (lead > 6.2) lead = 6.2;
   return lead;
+}
+function gapReadDelay(runner) {
+  const rct = Number(runner && runner.rct);
+  const r = isNaN(rct) ? 70 : rct;
+  if (r >= 90) return 0.1 - Math.min(10, r - 90) * 0.005;
+  if (r <= 50) return 0.5;
+  if (r <= 70) return 0.5 + (r - 50) * ((0.225 - 0.5) / 20);
+  return 0.225 + (r - 70) * ((0.1 - 0.225) / 20);
 }
 function tagSlack(runner) {
   const rct = runner ? (Number(runner.rct) || 70) : 70;
@@ -2082,7 +2167,10 @@ function baserunPlan(runner, from, to, read) {
   const two = !!read.twoOut;
   const flyHold = !!read.fly && !two && (from === 1 || from === 2);
   const groundHold = !!read.hold2 && !two && from === 2;
-  if ((flyHold || groundHold) && read.dropAt > 0.05) {
+  const gapGo = !!read.uncatchable && !two && from > 0 && from === read.leadFrom;
+  if (gapGo) {
+    plan.delay = (plan.delay || 0) + gapReadDelay(runner);
+  } else if ((flyHold || groundHold) && read.dropAt > 0.05) {
     plan.holdM = HALFWAY_M;
     plan.goAt = read.dropAt;
   }
@@ -2364,9 +2452,9 @@ function placeRunners(t) {
     const scored = p.r.targetIdx >= 4 && !p.r.retreat && p.free + 0.15 >= homeM;
     if (scored) {
       const tHome = arriveMeters(p.r, homeM);
-      block = { tHome: isFinite(tHome) ? tHome : t, openAbs: 4 * JUDGE_BASE_M - PASS_GAP_M, liveAbs: 4 * JUDGE_BASE_M - PASS_GAP_M };
+      block = { tHome: isFinite(tHome) ? tHome : t, openAbs: 4 * JUDGE_BASE_M - PASS_GAP_M, liveAbs: 4 * JUDGE_BASE_M - PASS_GAP_M, spd: p.r.speed };
     } else {
-      block = { tHome: null, liveAbs: p.r.startIdx * JUDGE_BASE_M + p.m - PASS_GAP_M };
+      block = { tHome: null, liveAbs: p.r.startIdx * JUDGE_BASE_M + p.m - PASS_GAP_M, spd: p.r.speed };
     }
   });
   let frontDone = true;
@@ -2438,8 +2526,13 @@ function syncThrow(elapsed) {
     if (elapsed + 1e-9 >= th.t0 && elapsed <= th.t0 + th.dur + 1e-9) {
       const span = th.dur > 1e-6 ? th.dur : 1e-6;
       const p = Math.max(0, Math.min(1, (elapsed - th.t0) / span));
-      const pt = throwPoint(th, p);
-      if (!throwBall) throwBall = { active: true, wild: !!th.wild, bounce: !!th.bounce, x: pt.x, y: pt.y, h: pt.h };
+      const pt = th.carry ? null : throwPoint(th, p);
+      let bx = pt ? pt.x : th.x0, by = pt ? pt.y : th.y0, bh = pt ? pt.h : 0.35;
+      if (th.carry) {
+        const holder = th.from ? fielderBy(th.from) : null;
+        if (holder) { bx = holder.x; by = holder.y; bh = 0.35; }
+      }
+      if (!throwBall) throwBall = { active: true, wild: !!th.wild, bounce: !!th.bounce, carry: !!th.carry, x: bx, y: by, h: bh };
       parked = null;
     } else if (elapsed > th.t0 + th.dur) parked = th;
   }
@@ -2471,7 +2564,8 @@ function commitThrows() {
     if (release == null) release = ball && ball.T_ball != null ? ball.T_ball + 0.4 : 0.36;
     seq.push({
       t0: release, dur: dur, x0: x0, y0: y0, x1: x1, y1: y1,
-      cx: spec.cx, cy: spec.cy, wild: !!spec.wild, bounce: !!spec.bounce && !spec.wild
+      cx: spec.cx, cy: spec.cy, wild: !!spec.wild, bounce: !!spec.bounce && !spec.wild,
+      carry: !!spec.carry, from: spec.from || null
     });
   });
   throwSeq = seq;
@@ -2523,6 +2617,36 @@ function presentPlay(t) {
   if (ball && throwSeq.length && t + 1e-6 >= throwSeq[0].t0) ball.hide = true;
   holdBall(t);
   maybeCaption(t);
+  syncBroadcast(t);
+}
+function decisionClock() {
+  let at = 0;
+  let threw = false;
+  for (let i = 0; i < throwSeq.length; i++) {
+    threw = true;
+    at = Math.max(at, throwSeq[i].t0 + throwSeq[i].dur);
+  }
+  if (!threw && ball) at = ball.fieldAt != null ? ball.fieldAt : (ball.T_ball || 0);
+  if (!(at > 0) && pitchFx) at = pitchFx.dur || 0.36;
+  return Math.max(0, at);
+}
+function syncBroadcast(t) {
+  if (!game || !game._deferResult || game._revealed) return;
+  if (t + 1e-4 >= (game._revealAt == null ? 0 : game._revealAt)) {
+    game._revealed = true;
+    game._holdOuts = false;
+    if (game._heldCaption) playCaption = game._heldCaption;
+    setBroadcast(game._finalBanner || '');
+    paintOuts();
+    return;
+  }
+  let line = '타격!';
+  if (throwSeq.length && t + 1e-6 >= throwSeq[0].t0) line = '송구 중...';
+  else if (ball && ball.fieldAt != null && t + 1e-6 >= ball.fieldAt && !(throwSeq.length && throwSeq[0].t0 > t)) line = '포구 후 처리 중...';
+  else if (ball && t + 1e-6 >= (ball.T_ball || 0)) line = '타구 낙하!';
+  else if (!ball && pitchFx) line = (pitchFx.name || '투구') + ' · 투구 중...';
+  const el = document.getElementById('broadcastText');
+  if (el && el.textContent !== line) setBroadcast(line);
 }
 function upcomingMark(t) {
   let n = Infinity;
@@ -2573,9 +2697,11 @@ function beginPlayback() {
   primeRunners();
   playElapsed = 0;
   playLingerUntil = 0;
+  if (game && game._deferResult) game._revealAt = decisionClock();
 }
 function grantOuts(n) {
   game.outs += n;
+  game._outsThisPlay = (game._outsThisPlay || 0) + n;
   const def = game.isTop ? game.home : game.away;
   if (def && def.pitcher) def.pitcher.outs = (def.pitcher.outs || 0) + n;
 }
@@ -2884,6 +3010,24 @@ function applyInfieldIn() {
   });
   return true;
 }
+const OF_DEEP = { LF: { x: -52, y: 81 }, CF: { x: 0, y: 97 }, RF: { x: 52, y: 81 } };
+function applyOutfieldDepth(batter) {
+  const loaded = !!(game && game.outs >= 2 && game.bases[0] && game.bases[1] && game.bases[2]);
+  const masher = !!(batter && (Number(batter.pow) || 0) >= 82);
+  if (!loaded && !masher) return false;
+  ['LF', 'CF', 'RF'].forEach(function (pos) {
+    const f = fielderBy(pos);
+    const deep = OF_DEEP[pos];
+    if (!f || !deep) return;
+    f.homeX = deep.x;
+    f.homeY = deep.y;
+    f.x = deep.x;
+    f.y = deep.y;
+    f.goalX = deep.x;
+    f.goalY = deep.y;
+  });
+  return true;
+}
 function applyWalkoffOutfieldIn() {
   if (!game || game.isTop || game.inning < 9) return false;
   if (game.home.score !== game.away.score) return false;
@@ -3094,13 +3238,19 @@ function settleHit(atk, def, batter, n, x, y, release, fld, homeOutRunner, homeD
   const pit = opts.pit || defensePitcher();
   const ballX = opts.ballX != null ? opts.ballX : x;
   const ballY = opts.ballY != null ? opts.ballY : y;
+  let leadFrom = 0;
+  for (let li = 2; li >= 0; li--) {
+    if (game.bases[li] && !(homeOutRunner && game.bases[li] === homeOutRunner)) { leadFrom = li + 1; break; }
+  }
   const read = {
     fly: !!opts.fly,
     dropAt: opts.dropAt,
     twoOut: opts.twoOut != null ? opts.twoOut : (game.outs >= 2),
     hold2: !!opts.hold2,
     batterDelay: opts.batterDelay || 0,
-    pit: pit
+    pit: pit,
+    uncatchable: !!opts.uncatchable,
+    leadFrom: leadFrom
   };
   const anim = [];
   const batterPlan = baserunPlan(batter, 0, Math.min(4, n), read);
@@ -3169,6 +3319,7 @@ function queueRelayOrBag(who, x, y, release, n, relay) {
 }
 function playBounce(atk, def, batter, shot, fielder, arriveT) {
   let x = shot.targetX, y = shot.targetY, releaseAt = arriveT, who = fielder || activeFielders[0];
+  const cantCatchFly = !shot.isGrounder && arriveT > (shot.flightT || shot.T_ball) + 1e-6;
   if (!shot.isGrounder && who) {
     const landT = shot.flightT || shot.T_ball;
     if ((shot.flightR || shot.R) > OUTFIELD_GRASS_M) {
@@ -3266,12 +3417,6 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
     }
   }
   const release = releaseAt + 0.32;
-  const deepThrow = Math.hypot(x, y) > OUTFIELD_GRASS_M && who && who.isOF;
-  const relay = deepThrow ? planRelay(who, x, y, release) : null;
-  const judgeX = relay ? relay.spot.x : x;
-  const judgeY = relay ? relay.spot.y : y;
-  const judgeRel = relay ? relay.rel2 : release;
-  const judgeFld = relay && relay.cut ? relay.cut.fld : (who ? who.fld : 70);
   const runRead = {
     fly: !shot.isGrounder && shot.launchAngle >= 15,
     dropAt: shot.flightT || shot.T_ball,
@@ -3279,9 +3424,35 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
     pit: defensePitcher(),
     ballX: x,
     ballY: y,
-    batterDelay: 0
+    batterDelay: 0,
+    uncatchable: cantCatchFly
   };
-  let n = batterSafeBases(batter.spd, judgeX, judgeY, judgeRel, judgeFld, batter, runRead);
+  let route = relayOrDirect(who, x, y, release, '2B');
+  let n = batterSafeBases(batter.spd, route.x, route.y, route.rel, route.fld, batter, runRead);
+  if (!(n === 1 && game.bases[1])) {
+    const key = n >= 3 ? '3B' : '2B';
+    const next = relayOrDirect(who, x, y, release, key);
+    n = batterSafeBases(batter.spd, next.x, next.y, next.rel, next.fld, batter, runRead);
+    const key2 = n >= 3 ? '3B' : '2B';
+    route = key2 === key ? next : relayOrDirect(who, x, y, release, key2);
+    if (route !== next) n = batterSafeBases(batter.spd, route.x, route.y, route.rel, route.fld, batter, runRead);
+  } else if (who && who.isOF) {
+    const homeRoute = relayOrDirect(who, x, y, release, 'HOME');
+    const nHome = batterSafeBases(batter.spd, homeRoute.x, homeRoute.y, homeRoute.rel, homeRoute.fld, batter, runRead);
+    if (homeRoute.relay && nHome === 1) {
+      route = homeRoute;
+      n = 1;
+    } else if (!homeRoute.relay) {
+      route = { relay: null, baseKey: 'HOME', x: x, y: y, rel: release, fld: who ? who.fld : 70 };
+      n = nHome;
+    }
+  }
+  const relay = route.relay;
+  const judgeX = route.x;
+  const judgeY = route.y;
+  const judgeRel = route.rel;
+  const judgeFld = route.fld;
+  if (game) game._relay = relay ? { cutId: relay.cutId, bagId: relay.bagId, spot: relay.spot, baseKey: route.baseKey } : null;
   let homeOutRunner = null;
   let cutoffPlay = null;
   if (relay && n === 1 && game.bases[1]) {
@@ -3782,13 +3953,52 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
   if ((bestF.pos === '2B' || bestF.pos === 'SS') && groundsNearSecond(shot) && game.bases[0] && !game.bases[2] && game.outs < 2) {
     return resolveSelfPivot(atk, def, batter, pit, bestF, shot, hand);
   }
-  const flight = throwFlight(bestF, shot.targetX, shot.targetY, 19.4, 19.4, hand.armScale);
-  const release = shot.T_ball + hand.pad;
-  const throwTime = release + flight.dur;
-  const cover = bestF.pos === '1B' && flight.dist > 11;
-  const coverAt = cover ? pitcherCoverArrive() : 0;
+  const flight0 = throwFlight(bestF, shot.targetX, shot.targetY, 19.4, 19.4, hand.armScale);
+  let flight = flight0;
+  let release = shot.T_ball + hand.pad;
+  let throwTime = release + flight.dur;
+  let cover = false;
+  let coverAt = 0;
+  let firstCarry = null;
+  if (bestF.pos === '1B') {
+    const distBag = Math.hypot((shot.targetX || 0) - 19.4, (shot.targetY || 0) - 19.4);
+    const fieldAt = Math.max(shot.T_ball, arriveTime(bestF, shot.targetX, shot.targetY));
+    const runDur = distBag / Math.max(0.1, moveSpeed(bestF));
+    const runTouch = fieldAt + runDur;
+    const mound = fielderBy('P');
+    const pArrive = mound ? pitcherCoverArrive() : Infinity;
+    const syncedRel = mound ? Math.max(release, pArrive - flight0.dur) : release;
+    const throwPlay = syncedRel + flight0.dur;
+    if (distBag <= 6.5 || !mound || runTouch <= throwPlay + 1e-9) {
+      firstCarry = { release: fieldAt, dur: Math.max(1e-4, runDur) };
+      flight = { arm: moveSpeed(bestF), dist: distBag, dur: firstCarry.dur, bounce: false };
+      release = fieldAt;
+      throwTime = runTouch;
+    } else {
+      cover = true;
+      coverAt = pArrive;
+      release = syncedRel;
+      flight = flight0;
+      throwTime = throwPlay;
+      game._coverP = true;
+      game._tag1 = false;
+    }
+  }
   const decideTime = cover ? Math.max(throwTime, coverAt) : throwTime;
-  const lateCover = cover && coverAt > batTime1B + 1e-9 && throwTime <= batTime1B + 1e-9;
+  const rawThrow = (shot.T_ball + hand.pad) + flight0.dur;
+  const lateCover = cover && coverAt > batTime1B + 1e-9 && rawThrow <= batTime1B + 1e-9;
+  function queueFirstOut() {
+    if (firstCarry && bestF) {
+      bestF.relayLeg = { at: firstCarry.release, x: 19.4, y: 19.4 };
+      game._tag1 = true;
+      game._coverP = false;
+    }
+    queueThrow({
+      from: bestF.pos, to: '1B', carry: !!firstCarry,
+      x0: shot.targetX, y0: shot.targetY, x1: 19.4, y1: 19.4,
+      release: release, dur: flight.dur, arm: flight.arm, bounce: !!flight.bounce && !firstCarry
+    });
+  }
   const wild = Math.random() < throwMiss(bestF, batter, pit);
   const drop = !wild && flight.bounce && !cover && Math.random() < oneBounceMiss(fielderBy('1B'));
   if (wild || drop) {
@@ -3801,7 +4011,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
     clockRunners(batDelay, 0);
     queueThrow({
       from: bestF.pos, to: '1B', x0: shot.targetX, y0: shot.targetY, x1: 30, y1: 12, wild: true,
-      release: release, dur: flight.dur, arm: flight.arm
+      release: shot.T_ball + hand.pad, dur: flight0.dur, arm: flight0.arm
     });
     game._form = 'ground';
     return (drop ? '⚠️ ' + bestF.name + ' 원바운드 송구가 1루 뒤로 빠졌습니다(E)! 타자 2루 진루!' : '⚠️ ' + bestF.name + ' 송구 악송구(E)! 타자 2루 진루!') + note;
@@ -3824,7 +4034,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
         game._form = 'dp';
         playCaption = { text: dpMark[bestF.pos] + ' 병살!', bad: false };
         queueThrow({ from: bestF.pos, to: '2B', toPos: pivot, x0: shot.targetX, y0: shot.targetY, x1: 0, y1: 38.8, release: rel1, dur: toss.dur, arm: toss.arm, bounce: toss.bounce });
-        queueThrow({ from: pivot, to: '1B', x0: 0, y0: 38.8, x1: 19.4, y1: 19.4, release: rel1 + toss.dur + 0.22, dur: back.dur, arm: back.arm, bounce: back.bounce });
+        queueThrow({ from: pivot, to: '1B', toPos: bestF.pos === '1B' ? 'P' : null, x0: 0, y0: 38.8, x1: 19.4, y1: 19.4, release: rel1 + toss.dur + 0.22, dur: back.dur, arm: back.arm, bounce: back.bounce });
         runnersAnim = [
           { startIdx: 1, targetIdx: 2, speed: runMetersPerSec(leadRunner.spd), delay: 0 },
           { startIdx: 0, targetIdx: 1, speed: runMetersPerSec(batter.spd), delay: batDelay }
@@ -3842,10 +4052,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
       const r2 = game.bases[1];
       grantOuts(1);
       touchHeat(batter, 0);
-      queueThrow({
-        from: bestF.pos, to: '1B', x0: shot.targetX, y0: shot.targetY, x1: 19.4, y1: 19.4,
-        release: release, dur: flight.dur, arm: flight.arm, bounce: flight.bounce
-      });
+      queueFirstOut();
       runnersAnim = [
         { startIdx: 0, targetIdx: 1, speed: runMetersPerSec(batter.spd), delay: batDelay, who: batter },
         baserunPlan(r2, 2, 3, { pit: pit })
@@ -3858,10 +4065,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
       const r2 = game.bases[1];
       grantOuts(1);
       touchHeat(batter, 0);
-      queueThrow({
-        from: bestF.pos, to: '1B', x0: shot.targetX, y0: shot.targetY, x1: 19.4, y1: 19.4,
-        release: release, dur: flight.dur, arm: flight.arm, bounce: flight.bounce
-      });
+      queueFirstOut();
       const lead = dynamicLead(r2, pit);
       runnersAnim = [
         { startIdx: 0, targetIdx: 1, speed: runMetersPerSec(batter.spd), delay: batDelay, who: batter },
@@ -3873,10 +4077,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
     const sprint = twoOutSprint(decideTime);
     grantOuts(1);
     touchHeat(batter, 0);
-    queueThrow({
-      from: bestF.pos, to: '1B', x0: shot.targetX, y0: shot.targetY, x1: 19.4, y1: 19.4,
-      release: release, dur: flight.dur, arm: flight.arm, bounce: flight.bounce
-    });
+    queueFirstOut();
     runnersAnim = [{ startIdx: 0, targetIdx: 1, speed: runMetersPerSec(batter.spd), delay: batDelay, who: batter }].concat(sprint);
     game._form = 'ground';
     return '❌ ' + batter.name + ' 땅볼 아웃 (' + bestF.name + ' → 1루)' + note;
@@ -3891,10 +4092,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
     twoOut: game.outs >= 2
   });
   clockRunners(batDelay, 'dyn');
-  queueThrow({
-    from: bestF.pos, to: '1B', x0: shot.targetX, y0: shot.targetY, x1: 19.4, y1: 19.4,
-    release: release, dur: flight.dur, arm: flight.arm, bounce: flight.bounce
-  });
+  queueFirstOut();
   armCaption('내야안타! (1루 세이프)', 'safe1');
   game._form = 'ground';
   let tail = note;
@@ -3922,9 +4120,25 @@ function finishPlate(atkTeam, batter, usedBatter, hook, msg, mentalNote, dur, sk
   if (mentalNote) msg += mentalNote;
   if (game.infieldIn && msg.indexOf('내야 전진') < 0) msg = '⬇ 내야 전진 수비. ' + msg;
   if (game.outfieldIn && msg.indexOf('외야 전진') < 0) msg = '🌲 외야 전진. ' + msg;
+  if (game.outfieldDeep && msg.indexOf('외야 깊게') < 0) msg = '🌲 외야 깊게. ' + msg;
   if (pitchFx && msg.indexOf(pitchFx.name) < 0) msg = pitchFx.name + ' · ' + msg;
   if (changeMsg) msg += ' | ' + changeMsg;
-  updateUI(msg);
+  const deferPlay = !skipAnim && !!(ball || throwPlan.length);
+  if (deferPlay) {
+    game._finalBanner = msg;
+    game._heldCaption = captionGate ? null : playCaption;
+    game._outsHeld = game._outsThisPlay || 0;
+    game._holdOuts = game._outsHeld > 0;
+    game._deferResult = true;
+    game._revealed = false;
+    game._revealAt = null;
+    if (!captionGate) playCaption = ball ? { text: '타격!', bad: false } : null;
+    updateUI(ball ? '타격!' : '플레이 진행 중...');
+  } else {
+    game._deferResult = false;
+    game._holdOuts = false;
+    updateUI(msg);
+  }
   glove = null;
   if (!skipAnim && ball && game._catch) {
     glove = {
@@ -3974,6 +4188,12 @@ function playAtBat(skipAnim) {
   game.banner = '';
   game.infieldIn = false;
   game.outfieldIn = false;
+  game.outfieldDeep = false;
+  game._outsThisPlay = 0;
+  game._deferResult = false;
+  game._holdOuts = false;
+  game._revealed = false;
+  game._relay = null;
   game.aura = false;
   game._form = '';
   setupDefenseFielders();
@@ -4000,6 +4220,7 @@ function playAtBat(skipAnim) {
 
   game.rbiBatter = batter;
   game.infieldIn = applyInfieldIn();
+  game.outfieldDeep = applyOutfieldDepth(batter);
   game.outfieldIn = applyWalkoffOutfieldIn();
   const fatiguePenalty = Math.max(0, (70 - pit.stamina) * 0.25);
   const stm = pit.stm == null ? 70 : pit.stm;
