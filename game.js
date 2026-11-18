@@ -140,7 +140,7 @@ function createTeam(prefix, ovr) {
 
 let game = null, animId = null, ball = null, runnersAnim = [], throwBall = null;
 let pitchFx = null;
-let view = { zoom: 1, mx: 0, my: 0, until: 0 };
+let view = { zoom: 1, mx: 0, my: 0, target: 1, zoomAt: 0, zoomOut: -1 };
 var TUNE = { gap: 0.04, up: 0.55, down: 1.56, range: 0.58 };
 const baseCoords = [{x:0,y:0}, {x:19.4,y:19.4}, {x:0,y:38.8}, {x:-19.4,y:19.4}, {x:0,y:0}];
 const fieldPosMap = {
@@ -187,7 +187,7 @@ function initGame(mode) {
   awayTurn = (awayTurn + 1) % 5;
   game = { away: away, home: home, inning: 1, isTop: true, outs: 0, bases: [null, null, null], isOver: false, mode: nextMode, resultSent: false, walkoff: false, wind: rollWind(), infieldIn: false, banner: '', userSide: nextMode === 'mirror' ? 'home' : (meta ? meta.userSide : 'home'), _tag1: false, _coverP: false, _needBag: '', _chaser: '', _ballX: 0, _catch: null, _closeInning: false, mirrored: mirrored };
   ball = null; runnersAnim = []; throwBall = null; throwSeq = []; throwPlan = []; glove = null; captionGate = null; captionHoldUntil = 0; playCaption = null; celebrate = null; pitchFx = null;
-  view = { zoom: 1, mx: 0, my: 0, until: 0 };
+  view = { zoom: 1, mx: 0, my: 0, target: 1, zoomAt: 0, zoomOut: -1 };
   const modal = document.getElementById('resultModal');
   if (modal) modal.hidden = true;
   setupDefenseFielders();
@@ -815,23 +815,36 @@ function throwMiss(f, batter, pit) {
   return Math.max(0.006, Math.min(0.12, 0.028 * (1 + diff * 0.02)));
 }
 function tickCamera() {
-  const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-  let rate = 1;
-  if (view.until && now < view.until) {
-    view.zoom = 1.5;
-    rate = 0.42;
-  } else {
-    if (view.zoom > 1) view.zoom = 1 + (view.zoom - 1) * 0.8;
-    if (view.zoom < 1.02) view.zoom = 1;
-  }
+  const t = playElapsed || 0;
+  const active = view.target > 1 && t + 1e-9 >= (view.zoomAt || 0) && t <= (view.zoomOut == null ? -1 : view.zoomOut);
+  const goal = active ? view.target : 1;
+  view.zoom += (goal - view.zoom) * (active ? 0.075 : 0.03);
+  if (view.zoom > 1.35) view.zoom = 1.35;
+  if (!active && view.zoom < 1.012) view.zoom = 1;
+  const rate = (active && view.zoom > 1.06) ? 0.72 : 1;
   return rate * (playSpeed || 1);
 }
-function armSlow(mx, my) {
+function closePlayZoom(margin) {
+  const gap = Math.abs(Number(margin) || 0);
+  if (!(gap <= 0.40)) return 0;
+  return 1.25 + 0.10 * (1 - gap / 0.40);
+}
+function armClose(mx, my, tArrive, margin) {
   if (game && game._skip) return;
+  const z = closePlayZoom(margin);
+  if (!(z > 1)) return;
+  const at = Math.max(0, (tArrive || 0) - 0.55);
+  if (view.target > 1 && z + 0.015 < view.target) return;
   view.mx = mx;
   view.my = my;
-  view.zoom = 1.5;
-  view.until = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + 500;
+  view.target = Math.min(1.35, z);
+  view.zoomAt = at;
+  view.zoomOut = (tArrive || 0) + 0.90;
+}
+function noteBaseRace(baseKey, tRun, tThrow) {
+  if (!(tRun >= 0) || !(tThrow >= 0) || !isFinite(tRun) || !isFinite(tThrow)) return;
+  const bag = bagPoint(baseKey || '1B');
+  armClose(bag.x, bag.y, Math.min(tRun, tThrow), tRun - tThrow);
 }
 function pickPitchKind(pit) {
   const r = Math.random();
@@ -1104,12 +1117,34 @@ function cutoffSpot(ballX, ballY, base, fld) {
   const dx = (ballX || 0) - bx;
   const dy = (ballY || 0) - by;
   const dist = Math.hypot(dx, dy) || 1;
-  const ahead = 12 + 3 * Math.max(0, Math.min(1, (dist - 60) / 40));
-  const reach = Math.min(ahead, Math.max(8, dist - 6));
+  const depth = Math.hypot(ballX || 0, ballY || 0);
+  let reach;
+  if (depth >= 75 || dist > 75) {
+    const span = Math.max(depth, dist);
+    const t = Math.max(0, Math.min(1, (span - 75) / 40));
+    reach = 15 + 10 * t;
+    if (reach > dist - 8) reach = Math.max(8, dist - 8);
+  } else {
+    const ahead = 12 + 3 * Math.max(0, Math.min(1, (dist - 60) / 40));
+    reach = Math.min(ahead, Math.max(8, dist - 6));
+  }
   const ux = dx / dist;
   const uy = dy / dist;
-  const px = bx + ux * reach;
-  const py = by + uy * reach;
+  let px = bx + ux * reach;
+  let py = by + uy * reach;
+  if ((depth >= 75 || dist > 75) && Math.hypot(px, py) < OUTFIELD_GRASS_M && dist > OUTFIELD_GRASS_M) {
+    let lo = reach;
+    let hi = Math.min(25, Math.max(reach, dist - 6));
+    for (let i = 0; i < 10; i++) {
+      const mid = (lo + hi) / 2;
+      const rr = Math.hypot(bx + ux * mid, by + uy * mid);
+      if (rr < OUTFIELD_GRASS_M) lo = mid;
+      else hi = mid;
+    }
+    reach = Math.min(25, Math.max(reach, hi));
+    px = bx + ux * reach;
+    py = by + uy * reach;
+  }
   const lat = cutoffLateral(fld);
   const side = (ballX || 0) >= 0 ? 1 : -1;
   return { x: px - uy * lat * side, y: py + ux * lat * side };
@@ -1140,15 +1175,15 @@ function relayTotalTime(relay, base) {
 }
 function relayOrDirect(who, x, y, release, baseKey) {
   const base = bagPoint(baseKey || '2B');
+  const dist = Math.hypot(base.x - x, base.y - y);
   const direct = {
     relay: null, baseKey: baseKey || '2B', x: x, y: y, rel: release,
     fld: who ? who.fld : 70, t: directThrowTime(who, x, y, release, base)
   };
   if (!who || !who.isOF) return direct;
-  if (Math.hypot(base.x - x, base.y - y) <= 60) return direct;
+  if (dist <= 75) return direct;
   const relay = planRelay(who, x, y, release, baseKey || '2B');
   const cutT = relayTotalTime(relay, base);
-  if (direct.t <= cutT + 1e-9) return direct;
   return {
     relay: relay, baseKey: baseKey || '2B', x: relay.spot.x, y: relay.spot.y,
     rel: relay.rel2, fld: relay.cut ? relay.cut.fld : direct.fld, t: cutT
@@ -2006,7 +2041,38 @@ function setGoals(chaserPos, tx, ty, mode) {
     if (fb) { fb.isTarget = true; fb.goalX = 19.4; fb.goalY = 19.4; }
   }
   applyOrganicBackups(chaserPos, tx, ty, mode);
+  advanceDeepCutoff(tx, ty, mode);
   stampLegs();
+}
+function markDeepBall(shot) {
+  if (!game) return;
+  if (!shot || shot.isGrounder) { game._deepBall = false; return; }
+  const land = Math.hypot(shot.targetX || 0, shot.targetY || 0);
+  game._deepBall = (shot.R || 0) >= 75 || land >= 75;
+}
+function advanceDeepCutoff(tx, ty, mode) {
+  const depth = Math.hypot(tx || 0, ty || 0);
+  const deep = depth >= 75 || !!(game && game._deepBall);
+  if (!deep) return;
+  if ((mode === 'ground' || mode === 'dp' || mode === 'home' || mode === 'pick' || mode === 'steal' || mode === 'block') && depth < 75) return;
+  const relay = game && game._relay;
+  const baseKey = (relay && relay.baseKey) || '2B';
+  const pair = relayPair(tx, (game && game._chaser) || '');
+  const cutId = (relay && relay.cutId) || pair.cut;
+  const bagId = (relay && relay.bagId) || pair.bag;
+  const cut = fielderBy(cutId);
+  const base = bagPoint(baseKey);
+  const spot = (relay && relay.spot) || (cut ? cutoffSpot(tx, ty, base, cut.fld) : null);
+  if (cut && !cut.isTarget && spot) {
+    cut.goalX = spot.x;
+    cut.goalY = spot.y;
+  }
+  const bagPos = baseKey === 'HOME' ? 'C' : (baseKey === '3B' ? '3B' : bagId);
+  const bagF = fielderBy(bagPos);
+  if (bagF && !bagF.isTarget && bagF !== cut) {
+    bagF.goalX = base.x;
+    bagF.goalY = base.y;
+  }
 }
 function legKey(x, y) {
   return (Math.round((x || 0) * 100) / 100) + ',' + (Math.round((y || 0) * 100) / 100);
@@ -3164,7 +3230,6 @@ function resolveDroppedThird(batter, pit, atk, def, checkCall) {
     });
     setGoals('1B', 19.4, 19.4, 'pick');
     playCaption = { text: '낫아웃 세이프!', bad: false };
-    armSlow(19.4, 19.4);
     return { msg: '🏃 낫아웃! 3스트라이크 공이 빠졌고 ' + batter.name + '이 1루까지 전력 질주해 세이프.' + (checkCall ? ' (체크스윙)' : '') + (res.runs ? ' ' + res.runs + '득점!' : '') };
   }
   grantOuts(1);
@@ -3176,7 +3241,6 @@ function resolveDroppedThird(batter, pit, atk, def, checkCall) {
   runnersAnim = [{ startIdx: 0, targetIdx: 1, speed: runMetersPerSec(batter.spd), delay: 0.25 }];
   setGoals('1B', 19.4, 19.4, 'pick');
   playCaption = { text: '낫아웃 아웃!', bad: true };
-  armSlow(19.4, 19.4);
   return { msg: '🚫 낫아웃! 포수 1루 송구로 ' + batter.name + ' 아웃.' + (checkCall ? ' (체크스윙 헛스윙)' : '') };
 }
 function layFielderChoice(batter, bestF, shot, arm) {
@@ -3230,6 +3294,26 @@ function batterSafeBases(spd, x, y, release, fld, batter, timing) {
     else break;
   }
   return n;
+}
+function readStretchDouble(batter, fieldAt, release, throwArrive) {
+  const speed = Math.max(0.1, runMetersPerSec(batter ? batter.spd : 70));
+  const tDecision = Math.max(0, JUDGE_BASE_M - 3) / speed;
+  const t2 = (2 * JUDGE_BASE_M) / speed;
+  const runTimeTo2B = t2 - tDecision;
+  const caught = fieldAt == null ? release : fieldAt;
+  const turnDelay = Math.max(0, release - caught);
+  const catchRemain = Math.max(0, caught - tDecision);
+  const turnRemain = tDecision >= release ? 0 : Math.max(0, (caught + turnDelay) - Math.max(tDecision, caught));
+  const flightRemain = Math.max(0, throwArrive - Math.max(tDecision, release));
+  const totalThrowTimeTo2B = catchRemain + turnRemain + flightRemain;
+  return {
+    go: runTimeTo2B <= totalThrowTimeTo2B + 0.20 + 1e-9,
+    t2: t2,
+    throwArrive: throwArrive,
+    runTimeTo2B: runTimeTo2B,
+    totalThrowTimeTo2B: totalThrowTimeTo2B,
+    margin: t2 - throwArrive
+  };
 }
 function settleHit(atk, def, batter, n, x, y, release, fld, homeOutRunner, homeDur, opts) {
   opts = opts || {};
@@ -3478,6 +3562,14 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
     if (shot.homeDrop) chargeError(def);
     if (!shot.homeDrop && throwT + tagSlack(runner) <= runT && throwOutAtHome(who, x, y, shot.flightT || shot.T_ball, releaseAt)) homeOutRunner = runner;
   }
+  let stretched = false;
+  if (n < 2 && !homeOutRunner && who && who.isOF && !game.bases[0] && route.baseKey === '2B') {
+    const stretch = readStretchDouble(batter, releaseAt, release, route.t);
+    if (stretch.go) {
+      n = 2;
+      stretched = true;
+    }
+  }
   if (game) game._homeOut = homeOutRunner;
   const homeDur = shot.homeDrop ? 99 : (shot.homeFlight ? shot.homeFlight.dur : null);
   const runs = settleHit(atk, def, batter, n, judgeX, judgeY, judgeRel, judgeFld, homeOutRunner, homeDur, runRead);
@@ -3491,6 +3583,7 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
     else hitName = ' 담장 직격 안타!';
   } else if (shot.cleared && n === 1) hitName = ' 키를 넘기는 안타!';
   let text = (n >= 2 ? '💥 ' : '⚾ ') + (fell ? '떨어지는 공 · ' : '') + batter.name + hitName + ' (비거리 ' + shot.R.toFixed(0) + 'm · ' + shot.exitSpeedKmh.toFixed(0) + 'km/h)';
+  if (stretched) text += ' · 1루 전방 3m에서 2루 승부';
   if (runs > 0) text += ' (' + runs + '타점!)';
   if (cutoffPlay && cutoffPlay.canOut) text += ' · ' + (relay.cut ? relay.cut.name : '컷오프') + ' 홈 중계 송구, ' + homeOutRunner.name + ' 아웃!';
   else if (homeOutRunner) text += ' · ' + homeOutRunner.name + ' 홈 쇄도, ' + who.name + ' 보살 아웃!';
@@ -3501,6 +3594,7 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
   else if (n === 3) playCaption = { text: shot.bounceBack ? '담장 직격 3루타!' : '3루타!', bad: false };
   else if (homeOutRunner) playCaption = { text: '홈 보살 아웃!', bad: true };
   else if (shot.bounceBack && n === 2) playCaption = { text: '담장 직격 2루타!', bad: false };
+  else if (stretched) playCaption = { text: '2루 승부!', bad: false };
   if (cutoffPlay && cutoffPlay.canOut) {
     queueThrow({
       from: who.pos, toPos: relay.cutId, x0: x, y0: y, x1: relay.spot.x, y1: relay.spot.y,
@@ -3526,13 +3620,22 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
     queueRelayOrBag(who, x, y, release, n, relay);
     if (n < 2) armCaption((shot.cleared && n === 1 ? '키를 넘기는 안타! ' : (fell ? '떨어지는 공 · ' : '')) + singleSide(x) + ' 안타!', 'after');
   }
+  if (n >= 2 && n < 4 && route.baseKey !== 'HOME') {
+    const tBag = (Math.min(n, 3) * JUDGE_BASE_M) / runMetersPerSec(batter.spd);
+    noteBaseRace(n >= 3 ? '3B' : '2B', tBag, route.t);
+  }
+  if (cutoffPlay) noteBaseRace('HOME', cutoffPlay.runT, cutoffPlay.throwHomeT);
+  else if (homeOutRunner && shot.homeFlight) {
+    const homePlan = baserunPlan(homeOutRunner, 2, 4, runRead);
+    noteBaseRace('HOME', arriveMeters(homePlan, 2 * JUDGE_BASE_M), release + shot.homeFlight.dur);
+  }
   return {
     msg: text, fielder: who,
     formation: n >= 2 ? 'hit' : 'relay2',
     showTail: !shot.isGrounder && (n >= 2 || shot.R >= 55)
   };
 }
-function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
+function resolveContact(atk, def, batter, pit, effCtrl, effStuff) {
   batter.ab++;
   let shot = launchBattedBall(batter, pit, effCtrl, effStuff, false);
   let chase = chaseBall(shot.targetX, shot.targetY, shot.interceptR);
@@ -3546,9 +3649,9 @@ function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
       touchHeat(batter, 0);
       runnersAnim = read.anim;
       playCaption = { text: '파울 플라이 포구!', bad: true };
+      markDeepBall(shot);
       setGoals(chase.bestF.pos, shot.targetX, shot.targetY, 'fly');
       ball = makeBall(shot, true, false);
-      armSlow(shot.targetX, shot.targetY);
       return foulNote + '🧤 파울 플라이 추격 포구! ' + chase.bestF.name + ' 아웃.';
     }
     foulNote = shot.isGrounder ? '3루선·1루선 바깥 땅볼은 파울이 됐고, ' : '파울 쪽 뜬공은 떨어졌고, ';
@@ -3614,7 +3717,6 @@ function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
       shot.targetX = shot.animLandX;
       shot.targetY = shot.animLandY;
       playCaption = { text: '담장 점프 호수비!', bad: true };
-      armSlow(shot.targetX, Math.min(shot.targetY, FENCE_DIST - 1));
       msg += '🧱 ' + bestF.name + ' 담장 점프 호수비! 홈런성 타구를 잡아냈습니다. (' + shot.R.toFixed(0) + 'm)';
       if (read.runs) msg += ' ' + read.runs + '점은 포구 전에 홈을 밟았습니다.';
     } else {
@@ -3624,7 +3726,6 @@ function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
       runnersAnim = res.animList;
       showTail = true;
       formation = 'hit';
-      if (lateClose) armSlow(shot.targetX * 0.7, shot.targetY * 0.7);
       playCaption = { text: '홈런!', bad: false };
       msg += '🎉 ' + batter.name + ' ' + (res.runs === 4 ? '만루' : res.runs + '점') + ' 홈런! (비거리 ' + shot.R.toFixed(0) + 'm · 타구속도 ' + shot.exitSpeedKmh.toFixed(0) + 'km/h)';
     }
@@ -3742,7 +3843,7 @@ function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
         addRuns(atk, def, 1);
         if (wild) { chargeError(def); playCaption = { text: bounceDrop ? '원바운드 포구 실책!' : '송구 악송구!', bad: true }; }
         else playCaption = { text: '희생플라이!', bad: false };
-        armSlow(0, 0);
+        if (!wild) noteBaseRace('HOME', tagT, throwT);
         msg += '👏 ' + batter.name + ' 희생플라이! 3루 주자 태그업 홈인 (1타점)' + (bounceDrop ? ' · 원바운드가 포수 뒤로 빠짐(E)' : (wild ? ' · 악송구(E)' : '')) + '!';
         runnersAnim = [{ startIdx: 3, targetIdx: 4, speed: runMetersPerSec(runner.spd), delay: shot.T_ball, who: runner }].concat(others.anim);
       }
@@ -3768,6 +3869,7 @@ function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
     showTail = bounced.showTail;
     formation = bounced.formation;
   }
+  markDeepBall(shot);
   setGoals(bestF.pos, shot.targetX, shot.targetY, formation);
   ball = makeBall(shot, showTail, fumble);
   return msg;
@@ -3795,6 +3897,7 @@ function resolveSelfPivot(atk, def, batter, pit, bestF, shot, hand) {
     from: bestF.pos, to: '1B', x0: 0, y0: 38.8, x1: 19.4, y1: 19.4,
     release: rel, dur: flight.dur, arm: flight.arm, bounce: flight.bounce && !wild, wild: wild
   });
+  if (!wild) noteBaseRace('1B', batTime, throwT);
   if (wild) {
     chargeError(def);
     batter.chr = 0;
@@ -3895,7 +3998,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
       from: bestF.pos, to: 'HOME', x0: shot.targetX, y0: shot.targetY, x1: wild ? 6 : 0, y1: wild ? -3 : 0, wild: wild,
       release: shot.T_ball + homePrep.pad, dur: homeFlight.dur, arm: homeFlight.arm, bounce: homeFlight.bounce && !wild
     });
-    armSlow(0, 0);
+    if (!wild) noteBaseRace('HOME', runT, throwT);
     if (!wild && throwT < runT) {
       grantOuts(1);
       const r1 = game.bases[0], r2 = game.bases[1];
@@ -3918,6 +4021,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
     const followAt = followRelease + to1.dur;
     const coverAt = bestF.pos === '1B' && to1.dist > 11 ? pitcherCoverArrive() : 0;
     const decide1 = Math.max(followAt, coverAt);
+    if (!wild) noteBaseRace('1B', batTime1B, decide1);
     if (!wild && decide1 <= batTime1B) {
       grantOuts(1);
       touchHeat(batter, 0);
@@ -3998,6 +4102,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
       x0: shot.targetX, y0: shot.targetY, x1: 19.4, y1: 19.4,
       release: release, dur: flight.dur, arm: flight.arm, bounce: !!flight.bounce && !firstCarry
     });
+    noteBaseRace('1B', batTime1B, decideTime);
   }
   const wild = Math.random() < throwMiss(bestF, batter, pit);
   const drop = !wild && flight.bounce && !cover && Math.random() < oneBounceMiss(fielderBy('1B'));
@@ -4035,6 +4140,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
         playCaption = { text: dpMark[bestF.pos] + ' 병살!', bad: false };
         queueThrow({ from: bestF.pos, to: '2B', toPos: pivot, x0: shot.targetX, y0: shot.targetY, x1: 0, y1: 38.8, release: rel1, dur: toss.dur, arm: toss.arm, bounce: toss.bounce });
         queueThrow({ from: pivot, to: '1B', toPos: bestF.pos === '1B' ? 'P' : null, x0: 0, y0: 38.8, x1: 19.4, y1: 19.4, release: rel1 + toss.dur + 0.22, dur: back.dur, arm: back.arm, bounce: back.bounce });
+        noteBaseRace('1B', batTime1B, turnT);
         runnersAnim = [
           { startIdx: 1, targetIdx: 2, speed: runMetersPerSec(leadRunner.spd), delay: 0 },
           { startIdx: 0, targetIdx: 1, speed: runMetersPerSec(batter.spd), delay: batDelay }
@@ -4194,13 +4300,14 @@ function playAtBat(skipAnim) {
   game._holdOuts = false;
   game._revealed = false;
   game._relay = null;
+  game._deepBall = false;
   game.aura = false;
   game._form = '';
   setupDefenseFielders();
   throwBall = null; throwSeq = []; throwPlan = []; glove = null; captionGate = null; captionHoldUntil = 0;
   runnersAnim = []; ball = null; pitchFx = null;
   game._tag1 = false; game._coverP = false; game._needBag = ''; game._chaser = ''; game._catch = null; game._sac3 = false; game._homeOut = null; game._backstop = false; game._selfPivot = ''; game.rbiBatter = null;
-  view.zoom = 1; view.until = 0;
+  view.zoom = 1; view.target = 1; view.zoomAt = 0; view.zoomOut = -1;
 
   const atkTeam = game.isTop ? game.away : game.home;
   const defTeam = game.isTop ? game.home : game.away;
@@ -4261,7 +4368,6 @@ function playAtBat(skipAnim) {
   const bbRate = Math.max(0.02, Math.min(0.28, 0.095 + (seeRct - 70) * 0.00105 + (batter.pow - 70) * 0.0005 - (launch - 12) * 0.0012 - (effCtrl - 70) * 0.00105 - (effSpd - 70) * 0.0005 - frame));
   let kRate = Math.max(0.06, Math.min(0.48, 0.19 + (launch - 12) * 0.0045 - (seeRct - 70) * 0.00115 - (seeCon - 70) * 0.00095 + (effSpd - 70) * 0.00115 + (pit.brk - 70) * 0.00095 + frame));
   if (seq.kAdd) kRate = Math.min(0.5, kRate + seq.kAdd);
-  const lateClose = game.inning >= 8 && Math.abs(atkTeam.score - defTeam.score) <= 2 && risp;
   let hbpP = 0;
   if (effCtrl < 72 && batter.rct < 72) hbpP = 0.005 + Math.min(0.005, ((72 - effCtrl) + (72 - batter.rct)) * 0.00012);
   if (Math.random() < hbpP) {
@@ -4271,7 +4377,6 @@ function playAtBat(skipAnim) {
     bump(atkTeam, 'hbp', 1);
     batter.chr = 0;
     playCaption = { text: '몸에 맞는 볼!', bad: false };
-    if (lateClose) armSlow(0, 1);
     const msg = '💢 몸에 맞는 볼! ' + batter.name + ' 사구 출루.' + (res.runs ? ' (밀어내기 ' + res.runs + '득점!)' : '');
     return finishPlate(atkTeam, batter, true, hook, msg, mentalNote, 0.9, skipAnim);
   }
@@ -4293,8 +4398,6 @@ function playAtBat(skipAnim) {
   } else if (outcome === 'bb' && Math.random() < 0.16 + Math.max(0, seeRct - 66) * 0.004) {
     checkCall = '볼';
   }
-  if (lateClose && (outcome === 'k' || outcome === 'bb')) armSlow(0, 1);
-
   let msg = '';
   let lead = '';
   if (outcome === 'bb') {
@@ -4332,8 +4435,7 @@ function playAtBat(skipAnim) {
       countHitter: !!count.hitter,
       countPitcher: !!count.pitcher
     };
-    if (lateClose && Math.random() < 0.45) armSlow(0, 8);
-    msg = resolveContact(atkTeam, defTeam, batter, pit, effCtrl, effStuff, lateClose);
+    msg = resolveContact(atkTeam, defTeam, batter, pit, effCtrl, effStuff);
   }
   finishPlate(atkTeam, batter, true, hook, lead + msg, mentalNote, 0.9, skipAnim);
 }
