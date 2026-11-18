@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>서울 히어로즈</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="stage">
+    <section id="lobby" class="screen">
+      <div class="lobby-bg" aria-hidden="true">
+        <div class="light l1"></div>
+        <div class="light l2"></div>
+        <div class="bowl"></div>
+        <div class="diamond"></div>
+        <div class="field-glow"></div>
+      </div>
+
+      <header class="lobby-top">
+        <div class="club-id">
+          <div class="crest" aria-hidden="true">SH</div>
+          <div>
+            <div class="club-name" id="clubName">서울 히어로즈</div>
+            <div class="club-level" id="clubLevel">구단 Lv.1</div>
+          </div>
+        </div>
+        <div class="currency">
+          <div class="pill gold"><i aria-hidden="true"></i><b id="goldText">10,000 G</b></div>
+          <div class="pill dia"><i aria-hidden="true"></i><b id="diaText">100 D</b></div>
+        </div>
+      </header>
+
+      <div class="lobby-main">
+        <nav class="mode-menu" aria-label="게임 모드">
+          <button type="button" id="btnLeague" class="mode-card league">
+            <span class="mode-kicker">MODE 01</span>
+            <span class="mode-title">리그 모드</span>
+            <span class="mode-en">LEAGUE</span>
+            <span class="mode-desc" id="leagueDesc">42경기 정규리그 · 종료 1,500 G · 승리 시 카드 팩</span>
+          </button>
+          <button type="button" id="btnLadder" class="mode-card ladder">
+            <span class="mode-kicker">MODE 02</span>
+            <span class="mode-title">래더 매치</span>
+            <span class="mode-en">LADDER</span>
+            <span class="mode-desc">시즌 준비 중 · 친선 평가전</span>
+          </button>
+          <button type="button" id="btnScout" class="mode-card scout">
+            <span class="mode-kicker">MODE 03</span>
+            <span class="mode-title">선수 영입</span>
+            <span class="mode-en">SCOUT</span>
+            <span class="mode-desc">1,500 G · 기본 선수 카드 팩</span>
+          </button>
+        </nav>
+        <div class="lobby-hero">
+          <div class="hero-copy">
+            <div class="hero-kicker" id="seasonKicker">시즌 1 · 루키 · 0/42경기</div>
+            <div class="hero-title" id="heroTitle">서울 히어로즈</div>
+            <p class="hero-status" id="lobbyStatus">정규 리그 경기가 대기 중입니다.</p>
+            <div class="hero-record" id="lobbyRecord">0승 0패 · 승률 -</div>
+          </div>
+          <div class="standings-wrap">
+            <div class="standings-title">리그 순위표</div>
+            <div id="standings"></div>
+          </div>
+        </div>
+      </div>
+
+      <nav class="lobby-tabs" aria-label="구단 관리">
+        <button type="button" id="btnLineup">팀 정보 / 라인업</button>
+        <button type="button" id="btnManage">강화 / 트레이드</button>
+        <button type="button" id="btnDex">카드 도감 (0/124)</button>
+        <button type="button" id="btnRecord">기록실</button>
+      </nav>
+
+      <div id="popup" class="overlay" hidden>
+        <div class="sheet" id="popupBody"></div>
+      </div>
+    </section>
+
+    <section id="match" class="screen" aria-hidden="true">
+      <canvas id="fieldCanvas"></canvas>
+
+      <header class="hud">
+        <div class="team away">
+          <div class="badge" id="awayBadge" aria-hidden="true">원</div>
+          <div class="team-meta">
+            <div class="tname" id="awayName">원정</div>
+            <div class="score" id="awayScore">0</div>
+          </div>
+        </div>
+        <div class="inning-box">
+          <div class="arrow top" id="inningArrow">▲</div>
+          <div class="inning-num" id="inningDisplay">1</div>
+          <div class="outs" id="outDisplay" aria-label="아웃 카운트"><i></i><i></i><i></i></div>
+        </div>
+        <div class="wind-chip" id="windChip">바람</div>
+        <div class="team home">
+          <div class="team-meta home-meta">
+            <div class="tname" id="homeName">홈</div>
+            <div class="score" id="homeScore">0</div>
+          </div>
+          <div class="badge home" id="homeBadge" aria-hidden="true">홈</div>
+        </div>
+      </header>
+      <div class="speed-bar" role="group" aria-label="경기 배속">
+        <button type="button" id="btnSpeed1" data-speed="1" class="on">1배속</button>
+        <button type="button" id="btnSpeed2" data-speed="2">2배속</button>
+        <button type="button" id="btnSpeed4" data-speed="4">4배속</button>
+        <button type="button" id="btnSim">빠른 결과 보기</button>
+        <button type="button" id="btnMirror" title="양 팀을 OVR 70으로 맞춘 테스트 경기">동일OVR</button>
+      </div>
+      <div id="paBanner" class="pa-banner" hidden></div>
+
+      <aside class="lineup-panel away">
+        <div class="panel-hdr"><span>원정</span><span id="awayHits">H 0</span></div>
+        <div class="lineup-list" id="awayLineupList"></div>
+        <div class="pitcher-info" id="awayPitcherBox"></div>
+      </aside>
+
+      <aside class="lineup-panel home">
+        <div class="panel-hdr"><span>홈</span><span id="homeHits">H 0</span></div>
+        <div class="lineup-list" id="homeLineupList"></div>
+        <div class="pitcher-info" id="homePitcherBox"></div>
+      </aside>
+
+      <div id="alertBanner" class="alert-banner" hidden></div>
+      <div class="broadcast-bar" id="broadcastText">경기 시작! [다음 타석] 버튼을 눌러주세요.</div>
+
+      <div class="ctrl-bar">
+        <button id="btnNext" title="다음 타석 (Space)"><span class="ico">▶</span><span class="cap">타석</span></button>
+        <button id="btnInning" title="1이닝 진행"><span class="ico">⏩</span><span class="cap">이닝</span></button>
+        <button id="btnFull" title="경기 종료까지"><span class="ico">🏆</span><span class="cap">종료</span></button>
+        <button id="btnNew" title="새 경기"><span class="ico">🔄</span><span class="cap">새로</span></button>
+        <button id="btnLobby" type="button" title="로비로"><span class="ico">⌂</span><span class="cap">로비</span></button>
+      </div>
+
+      <div id="resultModal" class="overlay" hidden>
+        <div class="sheet result-sheet">
+          <div class="result-kicker" id="resultKicker"></div>
+          <h2 id="resultTitle"></h2>
+          <p id="resultScore"></p>
+          <p id="resultReward"></p>
+          <button type="button" id="btnResultLobby">로비로</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="awardModal" class="overlay" hidden>
+      <div class="sheet award-sheet">
+        <div id="awardBody"></div>
+        <button type="button" id="btnAwardNext">확인</button>
+      </div>
+    </div>
+
+    <div id="cardStage" class="overlay card-stage" hidden>
+      <div id="revealFx" class="reveal-fx" hidden>
+        <div class="pillar"></div>
+        <canvas id="revealParticles"></canvas>
+      </div>
+      <div class="card-stage-box">
+        <div id="cardStageSlot"></div>
+        <p id="cardStageNote"></p>
+        <button type="button" id="cardStageOk">확인</button>
+      </div>
+    </div>
+  </div>
+<script src="game.js"></script>
+<script src="cards.js"></script>
+<script src="lobby.js"></script>
+</body>
+</html>
