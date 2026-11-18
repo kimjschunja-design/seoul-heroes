@@ -469,7 +469,9 @@ function drawFlame(p) {
 }
 function drawPitchFlight() {
   if (!pitchFx || !pitchFx.trail || pitchFx.trail.length < 1) return;
-  if (pitchFx.t > pitchFx.dur + 0.08) return;
+  if (pitchFx.holdUntil != null) {
+    if (playElapsed > pitchFx.holdUntil) return;
+  } else if (pitchFx.t > pitchFx.dur + 0.08) return;
   ctx.beginPath();
   pitchFx.trail.forEach(function (pt, i) {
     const p = toCanvas(pt[0], pt[1]);
@@ -1033,11 +1035,63 @@ function callInfieldPop(shot) {
   if (bestF) return { bestF: bestF, minFTime: minFTime, called: true };
   return { bestF: null, minFTime: 999, called: false };
 }
+function pitcherQuickStat(pit) {
+  if (pit && pit.rct != null && !isNaN(Number(pit.rct))) return Number(pit.rct);
+  return pit ? (Number(pit.spd) || 70) : 70;
+}
 function quickMotionDelay(pit) {
+  const r = pitcherQuickStat(pit);
+  if (r >= 90) return 1.12;
+  if (r <= 50) return 1.38;
+  return 1.25 + (70 - r) * 0.0065;
+}
+function pitchFlightTime(pit) {
   const spd = pit ? (Number(pit.spd) || 70) : 70;
+  return Math.max(0.38, Math.min(0.48, 0.42 - (spd - 70) * 0.0015));
+}
+function catcherPopTime(c) {
+  const f = c ? (Number(c.fld) || 70) : 70;
+  if (f >= 90) return 1.85;
+  if (f <= 50) return 2.18;
+  if (f >= 70) return 1.98 + (70 - f) * 0.0065;
+  return 2.18 + (f - 50) * ((1.98 - 2.18) / 20);
+}
+const STEAL_TRANSFER = 0.36;
+function stealBreakLead(runner, pit) {
+  const spd = runner ? (Number(runner.spd) || 70) : 70;
+  const rct = runner ? (Number(runner.rct) || 70) : 70;
+  const brk = pit ? (Number(pit.brk) || 70) : 70;
   const mnt = pit ? (Number(pit.mnt) || 70) : 70;
-  const raw = 0.42 - (spd - 70) * 0.0024 - (mnt - 70) * 0.0022;
-  return Math.max(0.34, Math.min(0.50, raw));
+  // spd 70 is 6.48m/s, so a 3.45s break from the lead to 2B starts about 5.07m off the bag.
+  const anchor = JUDGE_BASE_M - 3.45 * statMetersPerSec(70);
+  let lead = anchor + (spd - 70) * 0.016 + (rct - 70) * 0.01 - ((brk + mnt) / 2 - 70) * 0.012;
+  if (runner && runner._leadCut) lead -= runner._leadCut;
+  if (lead < 3.2) lead = 3.2;
+  if (lead > 6.2) lead = 6.2;
+  return lead;
+}
+function stealTimeline(pit, c, runner) {
+  const quick = quickMotionDelay(pit);
+  const flight = pitchFlightTime(pit);
+  const pop = catcherPopTime(c);
+  const receive = quick + flight;
+  const release = receive + STEAL_TRANSFER;
+  const arrive = receive + pop;
+  const lead = stealBreakLead(runner, pit);
+  const speed = runMetersPerSec(runner ? runner.spd : 70);
+  const runT = (JUDGE_BASE_M - lead) / Math.max(0.1, speed);
+  return {
+    quick: quick, flight: flight, pop: pop, receive: receive, release: release, arrive: arrive,
+    lead: lead, speed: speed, runT: runT, throwDur: Math.max(0.2, pop - STEAL_TRANSFER)
+  };
+}
+function armStealPitch(pit, quick, flight) {
+  const kind = (pit && pit._pitchKind) || pickPitchKind(pit);
+  if (pit) pit._pitchKind = kind;
+  pitchFx = {
+    kind: kind, name: pitchLabel(kind), t: 0, dur: quick + flight, releaseAt: quick,
+    holdUntil: quick + flight + STEAL_TRANSFER, trail: []
+  };
 }
 function flightZ(vy, gEff, h0, t) {
   if (gEff == null || vy == null) return null;
@@ -1119,7 +1173,8 @@ function cutoffSpot(ballX, ballY, base, fld) {
   const dist = Math.hypot(dx, dy) || 1;
   const depth = Math.hypot(ballX || 0, ballY || 0);
   let reach;
-  if (depth >= 75 || dist > 75) {
+  const onRelayLine = depth >= 75 || dist > 65;
+  if (onRelayLine) {
     const span = Math.max(depth, dist);
     const t = Math.max(0, Math.min(1, (span - 75) / 40));
     reach = 15 + 10 * t;
@@ -1132,7 +1187,7 @@ function cutoffSpot(ballX, ballY, base, fld) {
   const uy = dy / dist;
   let px = bx + ux * reach;
   let py = by + uy * reach;
-  if ((depth >= 75 || dist > 75) && Math.hypot(px, py) < OUTFIELD_GRASS_M && dist > OUTFIELD_GRASS_M) {
+  if (onRelayLine && Math.hypot(px, py) < OUTFIELD_GRASS_M && dist > OUTFIELD_GRASS_M) {
     let lo = reach;
     let hi = Math.min(25, Math.max(reach, dist - 6));
     for (let i = 0; i < 10; i++) {
@@ -1181,7 +1236,8 @@ function relayOrDirect(who, x, y, release, baseKey) {
     fld: who ? who.fld : 70, t: directThrowTime(who, x, y, release, base)
   };
   if (!who || !who.isOF) return direct;
-  if (dist <= 75) return direct;
+  if (dist <= 65) return direct;
+  if ((Number(who.fld) || 70) >= 90) return direct;
   const relay = planRelay(who, x, y, release, baseKey || '2B');
   const cutT = relayTotalTime(relay, base);
   return {
@@ -1397,44 +1453,116 @@ function applyOrganicBackups(chaserPos, tx, ty, mode) {
     }
   }
 }
+function rollClock(v, a, dist) {
+  if (!(v > 0) || !(a > 0)) return 0;
+  if (dist <= 1e-4) return 0;
+  const maxS = (v * v) / (2 * a);
+  if (dist >= maxS - 1e-3) return v / a;
+  return (v - Math.sqrt(Math.max(0, v * v - 2 * a * dist))) / a;
+}
+function rollMeters(v, a, t) {
+  if (!(v > 0) || !(a > 0) || !(t > 0)) return 0;
+  const tt = Math.min(t, v / a);
+  return v * tt - 0.5 * a * tt * tt;
+}
+function grassRollPace(shot) {
+  const R = shot.flightR || shot.R || 0;
+  const T = Math.max(0.35, shot.flightT || shot.T_ball || 0.35);
+  const vHoriz = R / T;
+  const launch = shot.launchAngle || 20;
+  const exit = shot.exitSpeedKmh || 0;
+  const onGrass = R > DIRT_EDGE_M;
+  let retain = launch > 28 ? 0.32 : 0.44;
+  let decel = onGrass ? 10.2 : 6.6;
+  if (shot.spin === 'back') retain *= 1.04;
+  else if (shot.spin === 'top') retain *= 0.9;
+  else if (shot.spin === 'dead') { retain = 0.1; decel = onGrass ? 16 : 12; }
+  if (exit >= 145 && launch <= 18 && shot.spin !== 'dead') {
+    retain = Math.max(retain, 0.6);
+    decel = 6.4;
+  } else if (R >= 98 && shot.spin !== 'dead') {
+    retain = Math.max(retain, 0.42);
+    decel = Math.min(decel, 4.2);
+  } else if (exit < 128 && R < 86) decel += 1.6;
+  let vB = Math.max(shot.spin === 'dead' ? 1.0 : 3.4, vHoriz * retain);
+  if (vB > 18.5) vB = 18.5;
+  return { vB: vB, decel: decel };
+}
 function planHop(shot, f) {
   const T = shot.flightT || shot.T_ball;
   const Lx = shot.targetX, Ly = shot.targetY;
   const dirx = Math.sin(shot.sprayRad), diry = Math.cos(shot.sprayRad);
-  const g = shot.gEff || 9.2;
-  const vy = shot.vy || 0;
-  const vz = Math.abs(vy - g * T);
-  let e = (shot.launchAngle || 20) > 30 ? 0.32 : 0.45;
-  let retain = (shot.launchAngle || 20) > 28 ? 0.36 : 0.5;
-  if (shot.spin === 'back') { e = 0.18; retain *= 1.08; }
-  else if (shot.spin === 'dead') { e = 0.05; retain = 0.1; }
-  const tHop = Math.max(shot.spin === 'dead' ? 0.12 : 0.28, Math.min(1.45, (2 * e * Math.max(1.2, vz)) / g));
-  const vHoriz = (shot.flightR || shot.R) / Math.max(0.35, T);
-  let vB = Math.max(shot.spin === 'dead' ? 1.2 : 5.5, Math.min(26, vHoriz * retain));
-  const onGrass = (shot.flightR || shot.R || 0) > DIRT_EDGE_M;
-  if (shot.spin === 'back') vB *= onGrass ? 0.98 : 1.05;
-  else if (shot.spin !== 'dead' && onGrass) vB *= 0.97;
-  let hopDist = vB * tHop;
-  if (shot.spin === 'dead') hopDist = Math.max(0.35, Math.min(1.35, hopDist));
-  else hopDist = Math.max(2.5, hopDist);
-  let chosen = null;
-  for (let i = 1; i <= 12; i++) {
-    const s = hopDist * (i / 12);
+  const pace = grassRollPace(shot);
+  const vB = pace.vB, decel = pace.decel;
+  const landR = Math.hypot(Lx, Ly) || (shot.flightR || shot.R || 0);
+  const fenceGap = Math.max(0, FENCE_DIST - landR);
+  const maxRoll = (vB * vB) / (2 * decel);
+  const travel = fenceGap > 0.4 ? Math.min(maxRoll, fenceGap) : maxRoll;
+  const hard = shot.spin !== 'dead' && ((shot.exitSpeedKmh || 0) >= 145 || landR >= 96);
+  const canFence = hard && fenceGap > 1.2 && landR >= 68 && maxRoll >= fenceGap - 0.4;
+  const fielders = [];
+  activeFielders.forEach(function (of) { if (of && of.isOF) fielders.push(of); });
+  if (f && fielders.indexOf(f) < 0) fielders.push(f);
+  let meet = null;
+  const steps = 18;
+  for (let i = 1; i <= steps && !meet; i++) {
+    const s = travel * (i / steps);
+    const tB = T + rollClock(vB, decel, s);
     const x = Lx + dirx * s;
     const y = Ly + diry * s;
-    const tB = T + s / vB;
-    const tF = arriveTime(f, x, y);
-    if (tF <= tB + 1e-4) { chosen = { x: x, y: y, tBall: tB, tField: tF, meet: tB }; break; }
+    for (let k = 0; k < fielders.length; k++) {
+      const of = fielders[k];
+      const tF = arriveTime(of, x, y);
+      if (tF <= tB + 1e-4) {
+        meet = { x: x, y: y, tBall: tB, tField: tF, meet: tB, hopDist: s, f: of };
+        break;
+      }
+    }
   }
-  if (!chosen) {
-    const x = Lx + dirx * hopDist;
-    const y = Ly + diry * hopDist;
-    const tB = T + hopDist / vB;
-    const tF = arriveTime(f, x, y);
-    chosen = { x: x, y: y, tBall: tB, tField: tF, meet: Math.max(tB, tF) };
+  if (!meet && canFence) {
+    const tWall = T + rollClock(vB, decel, fenceGap);
+    const vHit = Math.max(0, vB - decel * (tWall - T));
+    const wallX = FENCE_DIST * dirx;
+    const wallY = FENCE_DIST * diry;
+    const reboundV = Math.max(3.6, Math.min(9.2, vHit * 0.5));
+    const near = chaseBall(wallX, wallY, FENCE_DIST, { onlyOF: true });
+    const rf = (near && near.bestF) || f;
+    const read = cushionRead(rf ? rf.fld : 70);
+    const maxBack = Math.min(14, 5 + reboundV * 0.65);
+    let chosen = null;
+    for (let i = 0; i <= 12; i++) {
+      const s = maxBack * i / 12;
+      const x = wallX - dirx * s;
+      const y = wallY - diry * s;
+      const tB = tWall + s / reboundV;
+      const tF = rf ? arriveTime(rf, x, y) : tB;
+      if (tF <= tB + 1e-4) { chosen = { x: x, y: y, tBall: tB, tField: tF }; break; }
+    }
+    if (!chosen) {
+      const s = maxBack;
+      const x = wallX - dirx * s;
+      const y = wallY - diry * s;
+      chosen = { x: x, y: y, tBall: tWall + s / reboundV, tField: rf ? arriveTime(rf, x, y) : tWall };
+    }
+    return {
+      x: chosen.x, y: chosen.y, tBall: chosen.tBall, tField: chosen.tField,
+      meet: Math.max(chosen.tBall, chosen.tField) + read,
+      hopDist: fenceGap, rollV: vB, rollA: decel, hitFence: true, f: rf,
+      wallX: wallX, wallY: wallY, tWall: tWall, read: read
+    };
   }
-  chosen.hopDist = hopDist;
-  return chosen;
+  if (!meet) {
+    const s = travel;
+    const x = Lx + dirx * s;
+    const y = Ly + diry * s;
+    const tB = T + rollClock(vB, decel, s);
+    const tF = f ? arriveTime(f, x, y) : tB;
+    meet = { x: x, y: y, tBall: tB, tField: tF, meet: Math.max(tB, tF), hopDist: s, f: f };
+  }
+  meet.rollV = vB;
+  meet.rollA = decel;
+  meet.hitFence = false;
+  return meet;
 }
 function bestOutfieldMeet(shot) {
   const x0 = shot.targetX, y0 = shot.targetY;
@@ -1734,6 +1862,7 @@ function makeBall(shot, showTail, fumble) {
     maxH: shot.maxH, isGrounder: shot.isGrounder, elapsed: 0,
     T_ball: viewT, T_roll: shot.T_roll || viewT, totalTime: viewT,
     h0: shot.h0, vy: shot.vy, gEff: shot.gEff, hops: !!shot.hops, hopH: shot.hopH || 0.85,
+    rollV: shot.rollV || 0, rollA: shot.rollA || 0,
     showTail: showTail, exitKmh: shot.exitSpeedKmh, distance: shot.R, fumble: !!fumble,
     bounceBack: shot.bounceBack || null, kick: shot.kick || null,
     trail: [], windup: 0, started: false, fieldAt: null, holder: null
@@ -2148,10 +2277,15 @@ function placeBall(t) {
     }
   } else if (ball.bounceBack && t >= tb && t < ball.bounceBack.tWall) {
     const bb = ball.bounceBack;
-    const u = (t - tb) / Math.max(1e-4, bb.tWall - tb);
+    const span = Math.hypot(bb.wallX - landX, bb.wallY - landY);
+    let u;
+    if (ball.rollV > 0 && ball.rollA > 0) u = Math.max(0, Math.min(1, rollMeters(ball.rollV, ball.rollA, t - tb) / Math.max(0.05, span)));
+    else u = (t - tb) / Math.max(1e-4, bb.tWall - tb);
     x = landX + (bb.wallX - landX) * u;
     y = landY + (bb.wallY - landY) * u;
-    h = Math.sin(Math.min(1, Math.max(0, u)) * Math.PI) * 0.85;
+    const hopT = 0.42;
+    const dt = t - tb;
+    h = dt < hopT ? Math.sin((dt / hopT) * Math.PI) * 0.62 : 0;
   } else if (ball.bounceBack && t >= ball.bounceBack.tWall && t < ball.bounceBack.tBack) {
     const bb = ball.bounceBack;
     const u = (t - bb.tWall) / Math.max(1e-4, bb.tBack - bb.tWall);
@@ -2169,10 +2303,18 @@ function placeBall(t) {
     const z = ball.isGrounder ? null : flightZ(ball.vy, ball.gEff, ball.h0, t);
     h = ball.isGrounder ? Math.max(0, (1 - p) * 0.35) : (z == null ? Math.sin(p * Math.PI) * ball.maxH : z);
   } else if (t >= tb && ball.rolls && ball.T_roll > tb) {
-    const u = Math.min(1, (t - tb) / (ball.T_roll - tb));
+    let u;
+    if (ball.rollV > 0 && ball.rollA > 0) {
+      const span = Math.hypot(ball.rollX - landX, ball.rollY - landY);
+      u = Math.max(0, Math.min(1, rollMeters(ball.rollV, ball.rollA, t - tb) / Math.max(0.05, span)));
+    } else u = Math.min(1, (t - tb) / (ball.T_roll - tb));
     x = landX + (ball.rollX - landX) * u;
     y = landY + (ball.rollY - landY) * u;
-    h = ball.hops ? Math.sin(Math.min(1, u) * Math.PI) * (ball.hopH || 0.85) : 0;
+    if (ball.hops && ball.rollV > 0) {
+      const hopT = Math.min(0.5, Math.max(0.22, (ball.T_roll - tb) * 0.28));
+      const dt = t - tb;
+      h = dt < hopT ? Math.sin((dt / hopT) * Math.PI) * (ball.hopH || 0.55) : 0;
+    } else h = ball.hops ? Math.sin(Math.min(1, u) * Math.PI) * (ball.hopH || 0.85) : 0;
   } else if (t >= tb) {
     x = landX;
     y = landY;
@@ -2887,72 +3029,72 @@ function resolveFirstThirdSteal(atk, def, r1, r3, pit) {
   const c = fielderBy('C');
   const iq = catcherRead(c);
   const protect = iq >= 70;
-  const jump = (r1.rct - 70) * 0.004;
-  const stealDelay = Math.max(0.08, 0.22 - jump);
-  const speed1 = runMetersPerSec(r1.spd);
-  const cArm = armMetersPerSec(c ? c.fld : 70);
-  const quick = quickMotionDelay(pit);
-  const runT = stealDelay + JUDGE_BASE_M / speed1;
+  const tl = stealTimeline(pit, c, r1);
   const slack = tagSlack(r1);
   const lead3 = dynamicLead(r3, pit);
+  const cArm = armMetersPerSec(c ? c.fld : 70);
+  armStealPitch(pit, tl.quick, tl.flight);
   if (protect) {
     const cutD = 18.4 - (-1.5);
-    const cutT = quick + cutD / cArm;
+    const cutFlight = cutD / cArm;
+    const cutRelease = tl.receive + 0.16;
+    const cutT = cutRelease + cutFlight;
     const mound = fielderBy('P');
     const pArm = armMetersPerSec(mound ? mound.fld : 70);
     const relayD = 38.8 - 18.4;
     const relayRelease = cutT + 0.22;
     const relayDur = relayD / pArm;
-    const caught = relayRelease + relayDur + slack <= runT;
+    const throwArrive = relayRelease + relayDur;
+    const caught = throwArrive + slack <= tl.runT;
     setGoals(null, 0, 38.8, 'steal');
     queueThrow({
       from: 'C', to: 'P', x0: 0, y0: -1.5, x1: 0, y1: 18.4, wild: false, needsCatch: false,
-      release: quick, dur: cutD / cArm, arm: cArm
+      release: cutRelease, dur: cutFlight, arm: cArm
     });
     queueThrow({
       from: 'P', to: '2B', toPos: '2B', x0: 0, y0: 18.4, x1: 0, y1: 38.8, wild: false, needsCatch: false,
       release: relayRelease, dur: relayDur, arm: pArm
     });
     runnersAnim = [
-      { startIdx: 1, targetIdx: 2, speed: speed1, delay: stealDelay, who: r1 },
+      { startIdx: 1, targetIdx: 2, speed: tl.speed, delay: 0, leadM: tl.lead, who: r1 },
       { startIdx: 3, targetIdx: 3, speed: runMetersPerSec(r3.spd), delay: 0, leadM: lead3, who: r3, holdM: Math.min(5.5, HALFWAY_M), goAt: cutT, retreat: true }
     ];
+    noteBaseRace('2B', tl.runT, throwArrive);
     if (caught) {
       grantOuts(1);
       game.bases[0] = null;
       playCaption = { text: '컷오프 도루 저지!', bad: true };
-      return { msg: '🧤 1·3루. 포수가 3루 주자를 보고 투수에게 컷. ' + r3.name + '은 귀루, ' + r1.name + '은 2루 태그 아웃.', dur: 1.55 };
+      return { msg: '🧤 1·3루. 포수가 3루 주자를 보고 투수에게 컷. ' + r3.name + '은 귀루, ' + r1.name + '은 2루 태그 아웃.', dur: throwArrive + 0.35 };
     }
     game.bases[1] = r1;
     game.bases[0] = null;
     playCaption = { text: '컷오프, 2루 세이프', bad: false };
-    return { msg: '👀 포수 수비·판단으로 2루 송구를 끊었습니다. ' + r1.name + ' 2루 세이프, ' + r3.name + '은 3루 잔류.', dur: 1.55 };
+    return { msg: '👀 포수 수비·판단으로 2루 송구를 끊었습니다. ' + r1.name + ' 2루 세이프, ' + r3.name + '은 3루 잔류.', dur: throwArrive + 0.35 };
   }
-  const stealD = Math.hypot(0, 38.8 - (-1.5));
-  const throwT = quick + stealD / cArm;
-  const caught = throwT + slack <= runT;
-  const homeDelay = quick + 0.12;
+  const caught = tl.arrive + slack <= tl.runT;
+  const homeDelay = tl.receive + 0.15;
   setGoals(null, 0, 38.8, 'steal');
   queueThrow({
     from: 'C', to: '2B', toPos: '2B', x0: 0, y0: -1.5, x1: 0, y1: 38.8, wild: false, needsCatch: false,
-    release: quick, dur: stealD / cArm, arm: cArm
+    release: tl.release, dur: tl.throwDur, arm: cArm
   });
   runnersAnim = [
-    { startIdx: 1, targetIdx: 2, speed: speed1, delay: stealDelay, who: r1 },
+    { startIdx: 1, targetIdx: 2, speed: tl.speed, delay: 0, leadM: tl.lead, who: r1 },
     { startIdx: 3, targetIdx: 4, speed: runMetersPerSec(r3.spd), delay: homeDelay, leadM: lead3, who: r3 }
   ];
+  noteBaseRace('2B', tl.runT, tl.arrive);
   addRuns(atk, def, 1);
   game.bases[2] = null;
   if (caught) {
     grantOuts(1);
     game.bases[0] = null;
     playCaption = { text: '2루 아웃, 홈인', bad: true };
-    return { msg: '💨 포수가 2루 송구를 선택. ' + r1.name + ' 태그 아웃, ' + r3.name + '은 홈인.', dur: 1.55 };
+    return { msg: '💨 포수가 2루 송구를 선택. ' + r1.name + ' 태그 아웃, ' + r3.name + '은 홈인.', dur: tl.arrive + 0.35 };
   }
   game.bases[1] = r1;
   game.bases[0] = null;
   playCaption = { text: '더블 스틸!', bad: false };
-  return { msg: '💨 1·3루 더블 스틸! ' + r1.name + ' 2루, ' + r3.name + ' 홈인.', dur: 1.55 };
+  return { msg: '💨 1·3루 더블 스틸! ' + r1.name + ' 2루, ' + r3.name + ' 홈인.', dur: tl.arrive + 0.35 };
 }
 function resolveSidePlay(atk, def) {
   const r1 = game.bases[0];
@@ -2986,37 +3128,36 @@ function resolveSidePlay(atk, def) {
   if (r1.spd >= 70 && !game.bases[1] && game.outs < 2 && Math.random() < 0.11 + (r1.spd - 70) * 0.007) {
     if (game.bases[2]) return resolveFirstThirdSteal(atk, def, r1, game.bases[2], pit);
     const c = fielderBy('C');
-    const jump = (r1.rct - 70) * 0.004;
-    const stealDelay = Math.max(0.08, 0.22 - jump);
+    const tl = stealTimeline(pit, c, r1);
     const cArm = armMetersPerSec(c ? c.fld : 70);
-    const stealD = Math.hypot(0, 38.8 - (-1.5));
-    const quick = quickMotionDelay(pit);
-    const runT = stealDelay + 27.43 / statMetersPerSec(r1.spd);
-    const throwT = quick + stealD / cArm;
-    const margin = (throwT + tagSlack(r1)) - runT;
+    const margin = (tl.arrive + tagSlack(r1)) - tl.runT;
     const caught = margin <= 0;
+    armStealPitch(pit, tl.quick, tl.flight);
     setGoals(null, 0, 38.8, 'steal');
-    runnersAnim = [{ startIdx: 1, targetIdx: 2, speed: runMetersPerSec(r1.spd), delay: stealDelay }];
+    runnersAnim = [{ startIdx: 1, targetIdx: 2, speed: tl.speed, delay: 0, leadM: tl.lead, who: r1 }];
     queueThrow({
       from: 'C', to: '2B', toPos: '2B', x0: 0, y0: -1.5, x1: 0, y1: 38.8, wild: false, needsCatch: false,
-      release: quick, dur: stealD / cArm, arm: cArm
+      release: tl.release, dur: tl.throwDur, arm: cArm
     });
+    noteBaseRace('2B', tl.runT, tl.arrive);
     if (caught) {
       grantOuts(1);
       game.bases[0] = null;
       playCaption = { text: '도루 저지!', bad: true };
-      return { msg: '🚫 도루 저지! 포수가 ' + Math.abs(margin).toFixed(2) + '초 빨랐습니다. 2루 커버.', dur: 1.45 };
+      return { msg: '🚫 도루 저지! 포수가 ' + Math.abs(margin).toFixed(2) + '초 빨랐습니다. 2루 커버.', dur: tl.arrive + 0.35 };
     }
     game.bases[1] = r1;
     game.bases[0] = null;
     playCaption = { text: '도루 성공!', bad: false };
-    return { msg: '💨 ' + r1.name + ' 도루 성공! 주자가 ' + Math.max(0.01, margin).toFixed(2) + '초 앞섰습니다.', dur: 1.45 };
+    return { msg: '💨 ' + r1.name + ' 도루 성공! 주자가 ' + Math.max(0.01, margin).toFixed(2) + '초 앞섰습니다.', dur: tl.arrive + 0.35 };
   }
   return null;
 }
 function samplePitch() {
   if (!pitchFx) return;
-  const u = Math.min(1, pitchFx.t / pitchFx.dur);
+  const rel = pitchFx.releaseAt || 0;
+  const flight = Math.max(1e-4, (pitchFx.dur || 0.36) - rel);
+  const u = pitchFx.t <= rel ? 0 : Math.min(1, (pitchFx.t - rel) / flight);
   const pt = pitchPoint(pitchFx.kind, u);
   pitchFx.x = pt.x;
   pitchFx.y = pt.y;
@@ -3439,9 +3580,20 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
         }
         shot.animT = landT;
         shot.hops = true;
-        shot.hopH = Math.min(2.2, 0.45 + hop.hopDist * 0.035);
-        if (shot.spin === 'back') shot.hopH = Math.min(shot.hopH, 0.55);
-        else if (shot.spin === 'dead') shot.hopH = Math.min(shot.hopH, 0.22);
+        shot.rollV = hop.rollV;
+        shot.rollA = hop.rollA;
+        if (hop.f) who = hop.f;
+        if (hop.hitFence) {
+          shot.bounceBack = {
+            wallX: hop.wallX, wallY: hop.wallY, tWall: hop.tWall,
+            x: hop.x, y: hop.y, tBack: hop.tBall
+          };
+          shot.hopH = 0.62;
+        } else {
+          shot.hopH = Math.min(1.15, 0.32 + Math.min(hop.hopDist, 10) * 0.03);
+          if (shot.spin === 'back') shot.hopH = Math.min(shot.hopH, 0.48);
+          else if (shot.spin === 'dead') shot.hopH = Math.min(shot.hopH, 0.18);
+        }
         shot.targetX = hop.x;
         shot.targetY = hop.y;
         shot.T_roll = hop.tBall;
