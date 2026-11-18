@@ -33,6 +33,9 @@
  *      수비수는 startDelay 까지 기다린 뒤 moveSpeed 로 달려 arriveTime 에 닿는다.
  *      주자는 땅볼 스타트 0.45-(rct-70)*0.0025초(능력치 70에서 0.45초)·기습번트 0.32초·낫아웃 0.25초·선행주자 리드 이후
  *      runMetersPerSec 로 움직여 batTime1B·leadTime·canBeatThrow 시각에 베이스에 선다.
+ *      땅볼 1루는 그 정지 출발 평균 속도 그대로다. 홈에서 2루 이상으로 이어 뛸 때는 60ft(18.29m)에서
+ *      최고속(spd 70 = 7.6m/s)에 오른 뒤, 1루를 통과한 구간은 베이스당 라운딩 2.0m를 그 속도로 달린다.
+ *      도루는 리드 3.3m에서 순발 반응(rct 70 = 0.18초)과 정지 가속 손실 뒤에 그 최고속으로 뛴다.
  *      2아웃 전력 스타트, 0·1아웃 뜬공 하프웨이, 비포스 진루, 동적 리드(4.2~6.2m), 라운딩, 1루 오버런,
  *      추월 금지, 태그(+0.12초)·슬라이딩(−0.08초)도 이 시계의 m/s·초로만 계산한다.
  *      송구는 포구 후 0.32~0.42초 준비 뒤 armMetersPerSec 로 날아가
@@ -50,7 +53,29 @@
  *      z <= 2.15m 이면 서서 포구. 도착 시각 <= 통과 시각일 때만 아웃.
  *    - 통과 시각보다 늦으면 뜬공 아웃이 될 수 없다. 시계는 playElapsed 하나다.
  *
- * 5. 황금 밸런스(동 OVR 70): OPS 0.750 내외, 팀당 경기 득점 3.8~4.3. 투수 볼넷·삼진 공식은 유지한다.
+ * [절대 불변 원칙 제5조] 전 베이스 실시간 물리 시간 대결 및 ±0.15초 접전
+ *    - T_runner(base), T_defense(base)를 1루·2루·3루·홈에서 0.01초로 계산한다.
+ *      Δt = T_defense - T_runner.
+ *      Δt > +0.15 세이프 질주, Δt < -0.15 직전 베이스 정지.
+ *      |Δt| <= 0.15 에서는 승부를 건다.
+ *      0 <= Δt <= +0.15: fld가 높을수록 전환·태그 송구를 최대 0.12초 단축해 보살할 수 있다.
+ *      -0.15 <= Δt < 0: rct 90+ 약 80%, rct 70 약 50%, rct 50 이하 약 20%로 정지한다.
+ *      감지 실패는 질주하다 아웃이다. 포스는 정지할 수 없고 보너스만 같다.
+ *    - 2루타·3루타·도루 성공률은 타구 각도 조건이나 숫자 목표로 보정하지 않는다.
+ *    - 도루 스타트·투구·포구·송구는 이 판정과 같은 시계다.
+ *
+ * 6. 황금 밸런스(동 OVR 70): OPS 0.750 내외, 팀당 경기 득점 3.8~4.3.
+ *    능력치 70·발사각 12°에서 볼넷 약 9.5%, 삼진 약 19%, 삼진 하한 6%.
+ *    장타·도루·주루사 빈도는 제5조가 우선이며 숫자 목표로 되돌리지 않는다.
+ *
+ * 7. 타석은 1구 단위다. 볼넷·삼진·인플레이를 타석 시작 주사위로 확정하거나
+ *    virtualCount 로 가짜 카운트를 붙이지 않는다.
+ *    구속은 투구 비행 T_pitch, 제구는 로케이션 오차, 변화는 홈 앞 낙차,
+ *    구위는 타구 속도를 감쇠하고 파워는 타구 속도를 올린다.
+ * 8. 담장 충돌은 고정 처리 시간을 쓰지 않는다.
+ *    타구 방향과 펜스 법선의 입사각, 충돌 속도에서 반사 방향과 리바운드 거리를 구하고
+ *    외야수 시간은 (튕긴 공까지의 추가 추격 ÷ 이동속도) + 바닥 포구·180° 회전(수비 0.75~1.05초)이다.
+ *    공 좌표와 수비 궤적은 playElapsed 와 같은 초·m/s 다.
  */
 const canvas = document.getElementById('fieldCanvas'), ctx = canvas.getContext('2d');
 let SCALE = 3.9, HOME_X = 0, HOME_Y = 0;
@@ -140,8 +165,7 @@ function createTeam(prefix, ovr) {
 
 let game = null, animId = null, ball = null, runnersAnim = [], throwBall = null;
 let pitchFx = null;
-let view = { zoom: 1, mx: 0, my: 0, until: 0 };
-var TUNE = { gap: 0.04, up: 0.55, down: 1.56, range: 0.58 };
+let view = { zoom: 1, mx: 0, my: 0, target: 1, zoomAt: 0, zoomOut: -1 };
 const baseCoords = [{x:0,y:0}, {x:19.4,y:19.4}, {x:0,y:38.8}, {x:-19.4,y:19.4}, {x:0,y:0}];
 const fieldPosMap = {
   'P': {x:0, y:18.4, of:false}, 'C': {x:0, y:-1.5, of:false},
@@ -187,7 +211,7 @@ function initGame(mode) {
   awayTurn = (awayTurn + 1) % 5;
   game = { away: away, home: home, inning: 1, isTop: true, outs: 0, bases: [null, null, null], isOver: false, mode: nextMode, resultSent: false, walkoff: false, wind: rollWind(), infieldIn: false, banner: '', userSide: nextMode === 'mirror' ? 'home' : (meta ? meta.userSide : 'home'), _tag1: false, _coverP: false, _needBag: '', _chaser: '', _ballX: 0, _catch: null, _closeInning: false, mirrored: mirrored };
   ball = null; runnersAnim = []; throwBall = null; throwSeq = []; throwPlan = []; glove = null; captionGate = null; captionHoldUntil = 0; playCaption = null; celebrate = null; pitchFx = null;
-  view = { zoom: 1, mx: 0, my: 0, until: 0 };
+  view = { zoom: 1, mx: 0, my: 0, target: 1, zoomAt: 0, zoomOut: -1 };
   const modal = document.getElementById('resultModal');
   if (modal) modal.hidden = true;
   setupDefenseFielders();
@@ -469,7 +493,9 @@ function drawFlame(p) {
 }
 function drawPitchFlight() {
   if (!pitchFx || !pitchFx.trail || pitchFx.trail.length < 1) return;
-  if (pitchFx.t > pitchFx.dur + 0.08) return;
+  if (pitchFx.holdUntil != null) {
+    if (playElapsed > pitchFx.holdUntil) return;
+  } else if (pitchFx.t > pitchFx.dur + 0.08) return;
   ctx.beginPath();
   pitchFx.trail.forEach(function (pt, i) {
     const p = toCanvas(pt[0], pt[1]);
@@ -737,6 +763,13 @@ function statMetersPerSec(spd) {
   return Math.max(3.4, (Number(spd) || 70) / 90 * (100 / 12));
 }
 function runMetersPerSec(spd) { return statMetersPerSec(spd); }
+const TOP_RUN_AT_70 = 7.6;
+const ROUND_STEP_M = 2.0;
+const ACCEL_WINDOW_M = 18.29;
+function topRunMetersPerSec(spd) {
+  const ref = statMetersPerSec(70);
+  return statMetersPerSec(spd) * (TOP_RUN_AT_70 / ref);
+}
 function armMetersPerSec(fld) { return 18.5 + (Number(fld) || 70) * 0.108; }
 function startDelay(f) {
   const rct = Number(f && f.rct) || 70;
@@ -815,23 +848,36 @@ function throwMiss(f, batter, pit) {
   return Math.max(0.006, Math.min(0.12, 0.028 * (1 + diff * 0.02)));
 }
 function tickCamera() {
-  const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-  let rate = 1;
-  if (view.until && now < view.until) {
-    view.zoom = 1.5;
-    rate = 0.42;
-  } else {
-    if (view.zoom > 1) view.zoom = 1 + (view.zoom - 1) * 0.8;
-    if (view.zoom < 1.02) view.zoom = 1;
-  }
+  const t = playElapsed || 0;
+  const active = view.target > 1 && t + 1e-9 >= (view.zoomAt || 0) && t <= (view.zoomOut == null ? -1 : view.zoomOut);
+  const goal = active ? view.target : 1;
+  view.zoom += (goal - view.zoom) * (active ? 0.075 : 0.03);
+  if (view.zoom > 1.35) view.zoom = 1.35;
+  if (!active && view.zoom < 1.012) view.zoom = 1;
+  const rate = (active && view.zoom > 1.06) ? 0.72 : 1;
   return rate * (playSpeed || 1);
 }
-function armSlow(mx, my) {
+function closePlayZoom(margin) {
+  const gap = Math.abs(Number(margin) || 0);
+  if (!(gap <= 0.40)) return 0;
+  return 1.25 + 0.10 * (1 - gap / 0.40);
+}
+function armClose(mx, my, tArrive, margin) {
   if (game && game._skip) return;
+  const z = closePlayZoom(margin);
+  if (!(z > 1)) return;
+  const at = Math.max(0, (tArrive || 0) - 0.55);
+  if (view.target > 1 && z + 0.015 < view.target) return;
   view.mx = mx;
   view.my = my;
-  view.zoom = 1.5;
-  view.until = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + 500;
+  view.target = Math.min(1.35, z);
+  view.zoomAt = at;
+  view.zoomOut = (tArrive || 0) + 0.90;
+}
+function noteBaseRace(baseKey, tRun, tThrow) {
+  if (!(tRun >= 0) || !(tThrow >= 0) || !isFinite(tRun) || !isFinite(tThrow)) return;
+  const bag = bagPoint(baseKey || '1B');
+  armClose(bag.x, bag.y, Math.min(tRun, tThrow), tRun - tThrow);
 }
 function pickPitchKind(pit) {
   const r = Math.random();
@@ -845,10 +891,13 @@ function pitchLabel(kind) {
   if (kind === 'drop') return '낙차구';
   return '직구';
 }
-function beginPitch(pit) {
+function beginPitch(pit, flight) {
   const kind = (pit && pit._pitchKind) || pickPitchKind(pit);
   if (pit) pit._pitchKind = kind;
-  pitchFx = { kind: kind, name: pitchLabel(kind), t: 0, dur: 0.36, trail: [] };
+  const dur = flight > 0 ? flight : ((pit && pit._pitchFlight) || pitchFlightSeconds(pit ? (pit.spd || 70) : 70, kind));
+  const brk = pit ? (pit.brk || 70) : 70;
+  const bend = 0.78 + Math.max(0, brk - 40) / 85;
+  pitchFx = { kind: kind, name: pitchLabel(kind), t: 0, dur: dur, releaseAt: 0, bend: bend, trail: [] };
   return pitchFx.name;
 }
 function advanceWildRunners() {
@@ -1020,11 +1069,141 @@ function callInfieldPop(shot) {
   if (bestF) return { bestF: bestF, minFTime: minFTime, called: true };
   return { bestF: null, minFTime: 999, called: false };
 }
+function pitcherQuickStat(pit) {
+  if (pit && pit.rct != null && !isNaN(Number(pit.rct))) return Number(pit.rct);
+  return pit ? (Number(pit.spd) || 70) : 70;
+}
 function quickMotionDelay(pit) {
+  const r = pitcherQuickStat(pit);
+  if (r >= 90) return 1.12;
+  if (r <= 50) return 1.38;
+  return 1.25 + (70 - r) * 0.0065;
+}
+function pitchFlightSeconds(spd, kind) {
+  const s = Number(spd);
+  const v = isNaN(s) ? 70 : s;
+  // 직구 비행은 기존 도루 시계와 같은 식이다. 변화구·낙차구만 더 오래 떠 있다.
+  const fast = Math.max(0.38, Math.min(0.48, 0.42 - (v - 70) * 0.0015));
+  if (kind === 'break') return Math.min(0.56, fast + 0.055);
+  if (kind === 'drop') return Math.min(0.58, fast + 0.072);
+  return fast;
+}
+function pitchFlightTime(pit) {
+  if (pit && pit._pitchFlight > 0) return pit._pitchFlight;
   const spd = pit ? (Number(pit.spd) || 70) : 70;
+  return pitchFlightSeconds(spd, 'fast');
+}
+function pitcherLive(pit) {
+  const stamina = pit && pit.stamina != null ? pit.stamina : 100;
+  const fatigue = Math.max(0, (70 - stamina) * 0.25);
+  const mnt = pit && pit.mnt != null ? pit.mnt : 70;
+  let spd = (pit && pit.spd || 70) - fatigue * 0.9;
+  let ctrl = (pit && pit.ctrl || 70) - fatigue;
+  let stuff = (pit && pit.stuff || 70) - fatigue * 0.72;
+  const brk = pit && pit.brk || 70;
+  let note = '';
+  const fastOnFirst = !!(game && game.bases[0] && game.bases[0].spd >= 70);
+  const risp = !!(game && (game.bases[1] || game.bases[2]));
+  if (fastOnFirst && mnt < 70) {
+    ctrl -= (70 - mnt) * 0.18;
+    note = ' (주자의식)';
+  }
+  if (risp && mnt > 70) {
+    const clutch = (mnt - 70) * 0.14;
+    stuff += clutch;
+    ctrl += clutch;
+    note += ' (위기관리)';
+  }
+  return { spd: spd, ctrl: ctrl, stuff: stuff, brk: brk, mnt: mnt, note: note };
+}
+function spendPitch(pit) {
+  if (!pit) return 0;
+  const stm = pit.stm == null ? 70 : pit.stm;
+  const cost = Math.max(0.16, Math.min(0.48, 0.30 * (1 - (stm - 70) * 0.012)));
+  pit.pitches = (pit.pitches || 0) + 1;
+  pit.stamina = Math.max(8, (pit.stamina == null ? 100 : pit.stamina) - cost);
+  return cost;
+}
+function armDeliveredPitch(pit, spd) {
+  const kind = pickPitchKind(pit);
+  const flight = pitchFlightSeconds(spd, kind);
+  if (pit) {
+    pit._pitchKind = kind;
+    pit._pitchFlight = flight;
+    pit._armed = true;
+  }
+  return { kind: kind, flight: flight };
+}
+function deliverPitch(pit, spd) {
+  let kind, flight;
+  if (pit && pit._armed && pit._pitchKind && pit._pitchFlight > 0) {
+    kind = pit._pitchKind;
+    flight = pit._pitchFlight;
+    pit._armed = false;
+  } else {
+    kind = pickPitchKind(pit);
+    flight = pitchFlightSeconds(spd, kind);
+  }
+  if (pit) {
+    pit._pitchKind = kind;
+    pit._pitchFlight = flight;
+  }
+  return { kind: kind, flight: flight };
+}
+function catcherPopTime(c) {
+  const f = c ? (Number(c.fld) || 70) : 70;
+  if (f >= 90) return 1.85;
+  if (f <= 50) return 2.18;
+  if (f >= 70) return 1.98 + (70 - f) * 0.0065;
+  return 2.18 + (f - 50) * ((1.98 - 2.18) / 20);
+}
+const STEAL_TRANSFER = 0.36;
+const STEAL_LEAD_M = 3.3;
+const STEAL_ACCEL_LOSS = 0.25;
+// 옆을 보고 선 리드에서 2루 쪽으로 첫 발을 빼는 시간. 직선 가속 손실 0.25초와 더한다.
+const STEAL_CROSS_STEP = 0.08;
+function stealReact(rct) {
+  const raw = Number(rct);
+  const r = isNaN(raw) ? 70 : raw;
+  return 0.26 - (r - 50) * 0.004;
+}
+function stealBreakLead(runner, pit) {
+  const spd = runner ? (Number(runner.spd) || 70) : 70;
+  const rct = runner ? (Number(runner.rct) || 70) : 70;
+  const brk = pit ? (Number(pit.brk) || 70) : 70;
   const mnt = pit ? (Number(pit.mnt) || 70) : 70;
-  const raw = 0.42 - (spd - 70) * 0.0024 - (mnt - 70) * 0.0022;
-  return Math.max(0.34, Math.min(0.50, raw));
+  let lead = STEAL_LEAD_M + (spd - 70) * 0.016 + (rct - 70) * 0.01 - ((brk + mnt) / 2 - 70) * 0.012;
+  if (runner && runner._leadCut) lead -= runner._leadCut;
+  if (lead < 2.2) lead = 2.2;
+  if (lead > 4.8) lead = 4.8;
+  return lead;
+}
+function stealTimeline(pit, c, runner) {
+  const quick = quickMotionDelay(pit);
+  const flight = pitchFlightTime(pit);
+  const pop = catcherPopTime(c);
+  const receive = quick + flight;
+  const release = receive + STEAL_TRANSFER;
+  const arrive = receive + pop;
+  const lead = stealBreakLead(runner, pit);
+  const speed = topRunMetersPerSec(runner ? runner.spd : 70);
+  const react = stealReact(runner ? runner.rct : 70);
+  const delay = react + STEAL_ACCEL_LOSS + STEAL_CROSS_STEP;
+  const runT = delay + (JUDGE_BASE_M - lead) / Math.max(0.1, speed);
+  return {
+    quick: quick, flight: flight, pop: pop, receive: receive, release: release, arrive: arrive,
+    lead: lead, speed: speed, react: react, accel: STEAL_ACCEL_LOSS, cross: STEAL_CROSS_STEP,
+    delay: delay, runT: runT, throwDur: Math.max(0.2, pop - STEAL_TRANSFER)
+  };
+}
+function armStealPitch(pit, quick, flight) {
+  const kind = (pit && pit._pitchKind) || pickPitchKind(pit);
+  if (pit) pit._pitchKind = kind;
+  const bend = pit ? (0.78 + Math.max(0, (pit.brk || 70) - 40) / 85) : 1;
+  pitchFx = {
+    kind: kind, name: pitchLabel(kind), t: 0, dur: quick + flight, releaseAt: quick,
+    holdUntil: quick + flight + STEAL_TRANSFER, bend: bend, trail: []
+  };
 }
 function flightZ(vy, gEff, h0, t) {
   if (gEff == null || vy == null) return null;
@@ -1104,12 +1283,35 @@ function cutoffSpot(ballX, ballY, base, fld) {
   const dx = (ballX || 0) - bx;
   const dy = (ballY || 0) - by;
   const dist = Math.hypot(dx, dy) || 1;
-  const ahead = 12 + 3 * Math.max(0, Math.min(1, (dist - 60) / 40));
-  const reach = Math.min(ahead, Math.max(8, dist - 6));
+  const depth = Math.hypot(ballX || 0, ballY || 0);
+  let reach;
+  const onRelayLine = depth >= 75 || dist > 65;
+  if (onRelayLine) {
+    const span = Math.max(depth, dist);
+    const t = Math.max(0, Math.min(1, (span - 75) / 40));
+    reach = 15 + 10 * t;
+    if (reach > dist - 8) reach = Math.max(8, dist - 8);
+  } else {
+    const ahead = 12 + 3 * Math.max(0, Math.min(1, (dist - 60) / 40));
+    reach = Math.min(ahead, Math.max(8, dist - 6));
+  }
   const ux = dx / dist;
   const uy = dy / dist;
-  const px = bx + ux * reach;
-  const py = by + uy * reach;
+  let px = bx + ux * reach;
+  let py = by + uy * reach;
+  if (onRelayLine && Math.hypot(px, py) < OUTFIELD_GRASS_M && dist > OUTFIELD_GRASS_M) {
+    let lo = reach;
+    let hi = Math.min(25, Math.max(reach, dist - 6));
+    for (let i = 0; i < 10; i++) {
+      const mid = (lo + hi) / 2;
+      const rr = Math.hypot(bx + ux * mid, by + uy * mid);
+      if (rr < OUTFIELD_GRASS_M) lo = mid;
+      else hi = mid;
+    }
+    reach = Math.min(25, Math.max(reach, hi));
+    px = bx + ux * reach;
+    py = by + uy * reach;
+  }
   const lat = cutoffLateral(fld);
   const side = (ballX || 0) >= 0 ? 1 : -1;
   return { x: px - uy * lat * side, y: py + ux * lat * side };
@@ -1120,6 +1322,14 @@ function relayPair(x, chaser) {
   if (cut === chaser) { const swap = cut; cut = bag; bag = swap; }
   return { cut: cut, bag: bag };
 }
+function relayExchange(fld) {
+  const raw = Number(fld);
+  const f = isNaN(raw) ? 70 : raw;
+  const t = 0.55 - (f - 70) * 0.0065;
+  if (t < 0.36) return 0.36;
+  if (t > 0.85) return 0.85;
+  return t;
+}
 function planRelay(who, x, y, release, baseKey) {
   const pair = relayPair(x, who ? who.pos : '');
   const cut = fielderBy(pair.cut) || who;
@@ -1127,8 +1337,9 @@ function planRelay(who, x, y, release, baseKey) {
   const arm1 = armMetersPerSec(who ? who.fld : 70);
   const flight1 = Math.max(0.08, Math.hypot(spot.x - x, spot.y - y) / arm1);
   const cutRun = cut ? arriveTime(cut, spot.x, spot.y) : release + flight1;
-  const rel2 = Math.max(release + flight1, cutRun) + 0.22;
-  return { cut: cut, cutId: pair.cut, bagId: pair.bag, spot: spot, arm1: arm1, flight1: flight1, rel2: rel2 };
+  const exchange = relayExchange(cut ? cut.fld : 70);
+  const rel2 = Math.max(release + flight1, cutRun) + exchange;
+  return { cut: cut, cutId: pair.cut, bagId: pair.bag, spot: spot, arm1: arm1, flight1: flight1, exchange: exchange, rel2: rel2 };
 }
 function directThrowTime(who, x, y, release, base) {
   const arm = armMetersPerSec(who ? who.fld : 70);
@@ -1140,15 +1351,16 @@ function relayTotalTime(relay, base) {
 }
 function relayOrDirect(who, x, y, release, baseKey) {
   const base = bagPoint(baseKey || '2B');
+  const dist = Math.hypot(base.x - x, base.y - y);
   const direct = {
     relay: null, baseKey: baseKey || '2B', x: x, y: y, rel: release,
     fld: who ? who.fld : 70, t: directThrowTime(who, x, y, release, base)
   };
   if (!who || !who.isOF) return direct;
-  if (Math.hypot(base.x - x, base.y - y) <= 60) return direct;
+  if (dist <= 65) return direct;
+  if ((Number(who.fld) || 70) >= 90) return direct;
   const relay = planRelay(who, x, y, release, baseKey || '2B');
   const cutT = relayTotalTime(relay, base);
-  if (direct.t <= cutT + 1e-9) return direct;
   return {
     relay: relay, baseKey: baseKey || '2B', x: relay.spot.x, y: relay.spot.y,
     rel: relay.rel2, fld: relay.cut ? relay.cut.fld : direct.fld, t: cutT
@@ -1169,49 +1381,142 @@ function cushionRead(fld) {
   const skill = Number(fld) || 70;
   return Math.max(0.06, 0.28 - (skill - 70) * 0.0065);
 }
+function fencePickupTime(fld) {
+  const raw = Number(fld);
+  const f = isNaN(raw) ? 70 : raw;
+  const t = 1.05 - (f - 50) * (0.30 / 40);
+  if (t < 0.75) return 0.75;
+  if (t > 1.05) return 1.05;
+  return t;
+}
+function fenceRecover(fld) { return fencePickupTime(fld); }
+function fenceFace(sprayRad) {
+  const dirx = Math.sin(sprayRad), diry = Math.cos(sprayRad);
+  let yaw = Math.sin(Math.abs(sprayRad) * 2) * 1.05;
+  if (yaw > 0.95) yaw = 0.95;
+  const sign = sprayRad < 0 ? -1 : 1;
+  const normalAng = sprayRad - sign * yaw;
+  return {
+    dirx: dirx, diry: diry, yaw: yaw,
+    nx: Math.sin(normalAng), ny: Math.cos(normalAng),
+    wallX: FENCE_DIST * dirx, wallY: FENCE_DIST * diry
+  };
+}
+function fenceRebound(face, vHit) {
+  const v = Math.max(2.5, vHit || 0);
+  let cosI = face.dirx * face.nx + face.diry * face.ny;
+  if (cosI < 0.12) cosI = 0.12;
+  if (cosI > 1) cosI = 1;
+  const incidence = Math.acos(cosI);
+  const sinI = Math.sqrt(Math.max(0, 1 - cosI * cosI));
+  // 원형 담장 안쪽에 남도록, 반사 성분은 반경 방향(안쪽)과 원주 방향(옆 공간)으로만 나눈다.
+  const side = face.dirx < 0 ? -1 : 1;
+  const tx = face.diry * side;
+  const ty = -face.dirx * side;
+  const inward = 0.22 + 0.78 * cosI;
+  const lateral = sinI;
+  let rx = -face.dirx * inward + tx * lateral;
+  let ry = -face.diry * inward + ty * lateral;
+  const mag = Math.hypot(rx, ry) || 1;
+  rx /= mag; ry /= mag;
+  const glide = 1 - cosI;
+  const retain = 0.18 + 1.85 * glide;
+  const reboundSpeed = Math.max(2.6, v * retain);
+  const decel = 1.65 + cosI * 2.6;
+  let reboundDist = (reboundSpeed * reboundSpeed) / (2 * decel);
+  const minD = 2.6 + glide * 0.8;
+  const maxD = 4.6 + glide * 26 + Math.max(0, v - 7) * (0.12 + glide * 2.4);
+  if (reboundDist < minD) reboundDist = minD;
+  if (reboundDist > maxD) reboundDist = maxD;
+  return { incidence: incidence, cosI: cosI, reboundSpeed: reboundSpeed, decel: decel, rx: rx, ry: ry, reboundDist: reboundDist };
+}
+function parkFencePoint(x, y) {
+  let px = x, py = y;
+  if (py < 0.8) py = 0.8;
+  const r = Math.hypot(px, py);
+  const cap = FENCE_DIST - 1.35;
+  if (r > cap) {
+    const s = cap / r;
+    px *= s; py *= s;
+  }
+  return { x: px, y: py };
+}
+function fenceChase(f, wallX, wallY, ballX, ballY, tWall) {
+  const spd = Math.max(0.1, moveSpeed(f));
+  const delay = startDelay(f);
+  const dx = wallX - f.x, dy = wallY - f.y;
+  const dist = Math.hypot(dx, dy);
+  const tReach = delay + dist / spd;
+  let turnX, turnY, turnAt;
+  if (tReach <= tWall) {
+    turnX = wallX; turnY = wallY; turnAt = tWall;
+  } else {
+    const covered = Math.max(0, tWall - delay) * spd;
+    const u = dist > 0.001 ? Math.min(1, covered / dist) : 1;
+    turnX = f.x + dx * u;
+    turnY = f.y + dy * u;
+    turnAt = Math.max(tWall, delay);
+  }
+  const extra = Math.hypot(ballX - turnX, ballY - turnY);
+  return {
+    pos: f.pos, turnX: turnX, turnY: turnY, turnAt: turnAt,
+    ballX: ballX, ballY: ballY, extra: extra, tArrive: turnAt + extra / spd, spd: spd
+  };
+}
+function buildFenceCarom(sprayRad, tWall, vHit, hint) {
+  const face = fenceFace(sprayRad || 0);
+  const reb = fenceRebound(face, vHit);
+  const near = chaseBall(face.wallX, face.wallY, FENCE_DIST, { onlyOF: true });
+  const f = (near && near.bestF) || hint || null;
+  let chosen = null;
+  let chosenChase = null;
+  for (let i = 0; i <= 12; i++) {
+    const s = reb.reboundDist * (i / 12);
+    let x = face.wallX + reb.rx * s;
+    let y = face.wallY + reb.ry * s;
+    const parked = parkFencePoint(x, y);
+    x = parked.x; y = parked.y;
+    const traveled = Math.hypot(x - face.wallX, y - face.wallY);
+    const tB = tWall + rollClock(reb.reboundSpeed, reb.decel, traveled);
+    const chase = f ? fenceChase(f, face.wallX, face.wallY, x, y, tWall) : null;
+    const tF = chase ? chase.tArrive : tB;
+    if (tF <= tB + 1e-4) {
+      chosen = { x: x, y: y, tBall: tB, tField: tF };
+      chosenChase = chase;
+      break;
+    }
+  }
+  if (!chosen) {
+    let x = face.wallX + reb.rx * reb.reboundDist;
+    let y = face.wallY + reb.ry * reb.reboundDist;
+    const parked = parkFencePoint(x, y);
+    x = parked.x; y = parked.y;
+    const traveled = Math.hypot(x - face.wallX, y - face.wallY);
+    const tB = tWall + rollClock(reb.reboundSpeed, reb.decel, traveled);
+    const chase = f ? fenceChase(f, face.wallX, face.wallY, x, y, tWall) : null;
+    chosen = { x: x, y: y, tBall: tB, tField: chase ? chase.tArrive : tB };
+    chosenChase = chase;
+  }
+  return {
+    f: f, x: chosen.x, y: chosen.y, tBall: chosen.tBall, tField: chosen.tField,
+    meet: Math.max(chosen.tBall, chosen.tField),
+    wallX: face.wallX, wallY: face.wallY, tWall: tWall,
+    read: cushionRead(f ? f.fld : 70),
+    recover: fencePickupTime(f ? f.fld : 70),
+    reboundSpeed: reb.reboundSpeed, decel: reb.decel,
+    reboundDist: reb.reboundDist, incidence: reb.incidence,
+    cosI: reb.cosI, route: chosenChase
+  };
+}
 function planFenceCarom(shot, hint) {
   if (!shot || shot.isGrounder) return null;
   if (!(shot.R >= FENCE_CAROM_MIN && shot.R < FENCE_DIST)) return null;
-  const dirx = Math.sin(shot.sprayRad), diry = Math.cos(shot.sprayRad);
   const T = shot.flightT || shot.T_ball;
   const gap = Math.max(0.15, FENCE_DIST - shot.R);
   const vHoriz = (shot.flightR || shot.R) / Math.max(0.35, T);
   const vB = Math.max(6, Math.min(14, vHoriz * 0.38));
   const tWall = T + gap / vB;
-  const wallX = FENCE_DIST * dirx;
-  const wallY = FENCE_DIST * diry;
-  const near = chaseBall(wallX, wallY, FENCE_DIST, { onlyOF: true });
-  const f = (near && near.bestF) || hint;
-  const reboundV = Math.max(4.2, Math.min(9.5, vB * 0.62));
-  const read = cushionRead(f ? f.fld : 70);
-  const maxBack = Math.min(16, 7 + reboundV * 0.7);
-  let chosen = null;
-  for (let i = 0; i <= 12; i++) {
-    const s = (maxBack * i) / 12;
-    const x = wallX - dirx * s;
-    const y = wallY - diry * s;
-    const tB = tWall + s / reboundV;
-    const tF = f ? arriveTime(f, x, y) : tB;
-    if (tF <= tB + 1e-4) {
-      chosen = { x: x, y: y, tBall: tB, tField: tF };
-      break;
-    }
-  }
-  if (!chosen) {
-    const s = maxBack;
-    const x = wallX - dirx * s;
-    const y = wallY - diry * s;
-    const tB = tWall + s / reboundV;
-    const tF = f ? arriveTime(f, x, y) : tB;
-    chosen = { x: x, y: y, tBall: tB, tField: tF };
-  }
-  chosen.f = f;
-  chosen.wallX = wallX;
-  chosen.wallY = wallY;
-  chosen.tWall = tWall;
-  chosen.read = read;
-  chosen.meet = Math.max(chosen.tBall, chosen.tField) + read;
-  return chosen;
+  return buildFenceCarom(shot.sprayRad, tWall, vB, hint);
 }
 function groundBallZ(shot, r) {
   const R = Math.max(0.5, shot.R || 0.5);
@@ -1362,44 +1667,97 @@ function applyOrganicBackups(chaserPos, tx, ty, mode) {
     }
   }
 }
+function rollClock(v, a, dist) {
+  if (!(v > 0) || !(a > 0)) return 0;
+  if (dist <= 1e-4) return 0;
+  const maxS = (v * v) / (2 * a);
+  if (dist >= maxS - 1e-3) return v / a;
+  return (v - Math.sqrt(Math.max(0, v * v - 2 * a * dist))) / a;
+}
+function rollMeters(v, a, t) {
+  if (!(v > 0) || !(a > 0) || !(t > 0)) return 0;
+  const tt = Math.min(t, v / a);
+  return v * tt - 0.5 * a * tt * tt;
+}
+function grassRollPace(shot) {
+  const R = shot.flightR || shot.R || 0;
+  const T = Math.max(0.35, shot.flightT || shot.T_ball || 0.35);
+  const vHoriz = R / T;
+  const launch = shot.launchAngle || 20;
+  const exit = shot.exitSpeedKmh || 0;
+  const onGrass = R > DIRT_EDGE_M;
+  let retain = launch > 28 ? 0.32 : 0.44;
+  let decel = onGrass ? 10.2 : 6.6;
+  if (shot.spin === 'back') retain *= 1.04;
+  else if (shot.spin === 'top') retain *= 0.9;
+  else if (shot.spin === 'dead') { retain = 0.1; decel = onGrass ? 16 : 12; }
+  if (exit >= 145 && launch <= 18 && shot.spin !== 'dead') {
+    retain = Math.max(retain, 0.6);
+    decel = 6.4;
+  } else if (R >= 98 && shot.spin !== 'dead') {
+    retain = Math.max(retain, 0.42);
+    decel = Math.min(decel, 4.2);
+  } else if (exit < 128 && R < 86) decel += 1.6;
+  let vB = Math.max(shot.spin === 'dead' ? 1.0 : 3.4, vHoriz * retain);
+  if (vB > 18.5) vB = 18.5;
+  return { vB: vB, decel: decel };
+}
 function planHop(shot, f) {
   const T = shot.flightT || shot.T_ball;
   const Lx = shot.targetX, Ly = shot.targetY;
   const dirx = Math.sin(shot.sprayRad), diry = Math.cos(shot.sprayRad);
-  const g = shot.gEff || 9.2;
-  const vy = shot.vy || 0;
-  const vz = Math.abs(vy - g * T);
-  let e = (shot.launchAngle || 20) > 30 ? 0.32 : 0.45;
-  let retain = (shot.launchAngle || 20) > 28 ? 0.36 : 0.5;
-  if (shot.spin === 'back') { e = 0.18; retain *= 1.08; }
-  else if (shot.spin === 'dead') { e = 0.05; retain = 0.1; }
-  const tHop = Math.max(shot.spin === 'dead' ? 0.12 : 0.28, Math.min(1.45, (2 * e * Math.max(1.2, vz)) / g));
-  const vHoriz = (shot.flightR || shot.R) / Math.max(0.35, T);
-  let vB = Math.max(shot.spin === 'dead' ? 1.2 : 5.5, Math.min(26, vHoriz * retain));
-  const onGrass = (shot.flightR || shot.R || 0) > DIRT_EDGE_M;
-  if (shot.spin === 'back') vB *= onGrass ? 0.98 : 1.05;
-  else if (shot.spin !== 'dead' && onGrass) vB *= 0.97;
-  let hopDist = vB * tHop;
-  if (shot.spin === 'dead') hopDist = Math.max(0.35, Math.min(1.35, hopDist));
-  else hopDist = Math.max(2.5, hopDist);
-  let chosen = null;
-  for (let i = 1; i <= 12; i++) {
-    const s = hopDist * (i / 12);
+  const pace = grassRollPace(shot);
+  const vB = pace.vB, decel = pace.decel;
+  const landR = Math.hypot(Lx, Ly) || (shot.flightR || shot.R || 0);
+  const fenceGap = Math.max(0, FENCE_DIST - landR);
+  const maxRoll = (vB * vB) / (2 * decel);
+  const travel = fenceGap > 0.4 ? Math.min(maxRoll, fenceGap) : maxRoll;
+  const hard = shot.spin !== 'dead' && ((shot.exitSpeedKmh || 0) >= 145 || landR >= 96);
+  const canFence = hard && fenceGap > 1.2 && landR >= 68 && maxRoll >= fenceGap - 0.4;
+  const fielders = [];
+  activeFielders.forEach(function (of) { if (of && of.isOF) fielders.push(of); });
+  if (f && fielders.indexOf(f) < 0) fielders.push(f);
+  let meet = null;
+  const steps = 18;
+  for (let i = 1; i <= steps && !meet; i++) {
+    const s = travel * (i / steps);
+    const tB = T + rollClock(vB, decel, s);
     const x = Lx + dirx * s;
     const y = Ly + diry * s;
-    const tB = T + s / vB;
-    const tF = arriveTime(f, x, y);
-    if (tF <= tB + 1e-4) { chosen = { x: x, y: y, tBall: tB, tField: tF, meet: tB }; break; }
+    for (let k = 0; k < fielders.length; k++) {
+      const of = fielders[k];
+      const tF = arriveTime(of, x, y);
+      if (tF <= tB + 1e-4) {
+        meet = { x: x, y: y, tBall: tB, tField: tF, meet: tB, hopDist: s, f: of };
+        break;
+      }
+    }
   }
-  if (!chosen) {
-    const x = Lx + dirx * hopDist;
-    const y = Ly + diry * hopDist;
-    const tB = T + hopDist / vB;
-    const tF = arriveTime(f, x, y);
-    chosen = { x: x, y: y, tBall: tB, tField: tF, meet: Math.max(tB, tF) };
+  if (!meet && canFence) {
+    const tWall = T + rollClock(vB, decel, fenceGap);
+    const vHit = Math.max(2.5, vB - decel * (tWall - T));
+    const carom = buildFenceCarom(shot.sprayRad, tWall, vHit, f);
+    return {
+      x: carom.x, y: carom.y, tBall: carom.tBall, tField: carom.tField,
+      meet: carom.meet,
+      hopDist: fenceGap, rollV: vB, rollA: decel, hitFence: true, f: carom.f || f,
+      wallX: carom.wallX, wallY: carom.wallY, tWall: carom.tWall, read: carom.read, recover: carom.recover,
+      reboundSpeed: carom.reboundSpeed, reboundA: carom.decel, reboundDist: carom.reboundDist,
+      incidence: carom.incidence, route: carom.route
+    };
   }
-  chosen.hopDist = hopDist;
-  return chosen;
+  if (!meet) {
+    const s = travel;
+    const x = Lx + dirx * s;
+    const y = Ly + diry * s;
+    const tB = T + rollClock(vB, decel, s);
+    const tF = f ? arriveTime(f, x, y) : tB;
+    meet = { x: x, y: y, tBall: tB, tField: tF, meet: Math.max(tB, tF), hopDist: s, f: f };
+  }
+  meet.rollV = vB;
+  meet.rollA = decel;
+  meet.hitFence = false;
+  return meet;
 }
 function bestOutfieldMeet(shot) {
   const x0 = shot.targetX, y0 = shot.targetY;
@@ -1476,16 +1834,18 @@ function spinKind(launchAngle, slowRoll) {
   if (launchAngle >= 0 && launchAngle < 10) return 'top';
   return 'flat';
 }
-function contactPlane(batter, effCtrl, effStuff) {
+function contactPlane(batter, effCtrl, effBrk) {
   const pa = batter._pa || null;
   const con = pa && pa.con != null ? pa.con : batter.con;
   const rct = pa && pa.rct != null ? pa.rct : batter.rct;
   const effSpd = pa && pa.effSpd != null ? pa.effSpd : 70;
-  const press = (effStuff - con) * 0.52 + (effCtrl - con) * 0.28;
-  const xOffset = clampUnit(randNormal(press / 46, 0.22));
-  let yOffset = clampUnit(randNormal((effSpd - rct) * 0.42 / 40, 0.2));
+  const command = Math.max(0, ((effCtrl + effBrk) / 2 - 70));
+  const sd = clampRange(0.20 + (70 - con) * 0.0042 + command * 0.0032, 0.08, 0.42);
+  const xOffset = clampUnit(randNormal(0, sd));
+  let yOffset = clampUnit(randNormal((effSpd - rct) * 0.40 / 40, 0.15 + Math.max(0, 70 - rct) * 0.0022));
   const kick = pa && pa.seqKick ? pa.seqKick : 0;
   if (kick > 0) yOffset = clampUnit(yOffset + (Math.random() < 0.5 ? -kick : kick));
+  if (pa && pa.chase) yOffset = clampUnit(yOffset + (Math.random() < 0.5 ? -0.18 : 0.18));
   return { xOffset: xOffset, yOffset: yOffset };
 }
 function applyPullShift(batter) {
@@ -1511,50 +1871,215 @@ function pickWeighted(rows) {
   }
   return rows[rows.length - 1];
 }
-function virtualCount(outcome) {
-  let row;
-  if (outcome === 'bb') row = pickWeighted([{ b: 3, s: 0, w: 22 }, { b: 3, s: 1, w: 40 }, { b: 3, s: 2, w: 38 }]);
-  else if (outcome === 'k') row = pickWeighted([{ b: 0, s: 2, w: 18 }, { b: 1, s: 2, w: 34 }, { b: 2, s: 2, w: 30 }, { b: 3, s: 2, w: 18 }]);
-  else row = pickWeighted([
-    { b: 0, s: 0, w: 8 }, { b: 1, s: 0, w: 7 }, { b: 2, s: 0, w: 6 }, { b: 3, s: 1, w: 5 },
-    { b: 0, s: 1, w: 8 }, { b: 1, s: 1, w: 10 }, { b: 2, s: 1, w: 8 }, { b: 3, s: 2, w: 6 },
-    { b: 0, s: 2, w: 7 }, { b: 1, s: 2, w: 8 }, { b: 2, s: 2, w: 7 }
-  ]);
-  return {
-    balls: row.b, strikes: row.s,
-    hitter: (row.b === 2 && row.s === 0) || (row.b === 3 && row.s === 1),
-    pitcher: row.s === 2 && row.b <= 1,
-    full: row.b === 3 && row.s === 2
+function clampRange(n, lo, hi) {
+  if (n < lo) return lo;
+  if (n > hi) return hi;
+  return n;
+}
+function pitchLogLine(log, outcome) {
+  if (!log || !log.length) return '';
+  const bits = log.map(function (p) { return p.n + '구 ' + p.name + ' ' + p.call; });
+  let shown = bits;
+  if (bits.length > 7) shown = bits.slice(0, 2).concat(['…']).concat(bits.slice(-3));
+  const last = log[log.length - 1];
+  let tag = '';
+  if (outcome === 'bb') tag = '볼넷';
+  else if (outcome === 'k') tag = (last.call === '헛스윙' || last.call === '체크스윙') ? '삼진' : '루킹 삼진';
+  else if (outcome === 'hbp') tag = '사구';
+  else if (last.balls >= 2 && last.strikes < 2) tag = '타자 유리';
+  else if (last.strikes >= 2 && last.balls <= 1) tag = '투수 유리';
+  return '[' + shown.join(' · ') + (tag ? ' · ' + tag : '') + '] ';
+}
+function pitchAim(pow, balls, strikes) {
+  const must = balls >= 3 ? 0.55 : balls === 2 ? 0.22 : 0;
+  const expand = strikes >= 2 ? 0.16 : strikes === 1 ? 0.06 : 0;
+  const fear = Math.max(0, (pow || 70) - 68) / 26;
+  let edge = 0.66 + fear * 0.11 + expand * 0.10 - must * 0.42;
+  if (balls >= 3 && strikes < 2) edge = Math.min(edge, 0.28);
+  edge = clampRange(edge, 0.06, 0.98);
+  const ang = Math.random() * Math.PI * 2;
+  const r = edge * (0.55 + Math.random() * 0.7);
+  return { x: Math.cos(ang) * r, z: 0.5 + Math.sin(ang) * r * 0.62 };
+}
+function locatePitch(aim, eff, kind) {
+  let sigma = 0.205 - (eff.ctrl - 70) * 0.0034;
+  sigma += Math.max(0, eff.brk - 76) * 0.0013;
+  sigma = clampRange(sigma, 0.07, 0.36);
+  const x = aim.x + randNormal(0, sigma);
+  const z = aim.z + randNormal(0, sigma * 0.92);
+  const brkMag = 0.05 + Math.max(0, eff.brk - 40) * 0.0035;
+  let bx = 0, bz = 0;
+  if (kind === 'break') { bx = (Math.random() < 0.5 ? -1 : 1) * brkMag; bz = -brkMag * 0.28; }
+  else if (kind === 'drop') { bz = -brkMag * 1.1; bx = (Math.random() - 0.5) * brkMag * 0.32; }
+  else bz = -0.03 - Math.max(0, eff.spd - 70) * 0.0008;
+  return { x: x, z: z, seenX: x - bx * 0.72, seenZ: z - bz * 0.72 };
+}
+function zoneOf(x, z) {
+  const inZone = Math.abs(x) <= 0.58 && z >= 0.25 && z <= 0.75;
+  const border = !inZone && Math.abs(x) <= 0.76 && z >= 0.15 && z <= 0.86;
+  const heart = inZone && Math.abs(x) <= 0.28 && z >= 0.39 && z <= 0.63;
+  const dist = Math.hypot(Math.max(0, Math.abs(x) - 0.58), Math.max(0, 0.25 - z, z - 0.75));
+  return { inZone: inZone, border: border, heart: heart, dist: dist };
+}
+function swingChance(eye, zone, balls, strikes, pitchNum, read) {
+  const pow = eye.pow, rct = eye.rct, con = eye.con;
+  const twoK = strikes >= 2;
+  const early = pitchNum < 2;
+  if (zone.inZone) {
+    let p = 0.70;
+    const patience = clampRange((80 - rct) / 22, 0, 1);
+    if (pitchNum === 0) p = 0.58 + Math.max(0, pow - 70) * 0.012 + Math.min(0, pow - 70) * 0.0016 * patience + Math.max(0, rct - 70) * 0.011 + Math.max(0, con - 74) * 0.0038;
+    else if (pitchNum === 1) p = 0.64 + Math.max(0, pow - 70) * 0.0085 + Math.min(0, pow - 70) * 0.0012 * patience + Math.max(0, rct - 70) * 0.0072 + Math.max(0, con - 74) * 0.0026;
+    if (twoK) p = Math.max(p, 0.88 + Math.max(0, 72 - pow) * 0.0014);
+    if (balls >= 3 && !twoK) p *= 0.32 + Math.max(0, 80 - rct) * 0.005;
+    else if (balls === 2 && strikes === 0) p *= 0.76;
+    p += Math.max(0, con - 80) * 0.001;
+    return clampRange(p, 0.08, 0.97);
+  }
+  let p = 0.25 + Math.max(0, pow - 70) * 0.0050 + Math.min(0, pow - 70) * 0.0038;
+  p -= (rct - 70) * 0.0052;
+  p -= read * 0.30;
+  p -= Math.max(0, zone.dist - 0.06) * 0.36;
+  if (early && pow < 66) p -= 0.055;
+  if (early && pow >= 84) p += 0.014;
+  if (twoK) p += 0.10 + Math.max(0, pow - 78) * 0.002;
+  if (balls >= 3 && !twoK) p *= 0.2;
+  return clampRange(p, 0.012, 0.8);
+}
+function whiffChance(eye, eff, zone, twoK, read, kind, seq) {
+  let w = 0.132;
+  w += (eff.spd - 70) * 0.0044;
+  w += (eff.brk - 70) * 0.0034;
+  w += (eff.stuff - 70) * 0.0014;
+  w -= (eye.rct - 70) * 0.0046;
+  w -= (eye.con - 70) * 0.0074;
+  w += Math.max(0, (eye.launch || 12) - 12) * 0.0038;
+  w += Math.max(0, -read) * (kind === 'fast' ? 0.07 : 0.18);
+  if (!zone.inZone) w += 0.065 + zone.dist * 0.28;
+  if (twoK && eye.pow < 74) w -= (74 - eye.pow) * 0.0025;
+  if (seq && seq.kAdd) w += seq.kAdd * 2.2;
+  const floor = 0.058 + Math.max(0, (eye.launch || 12) - 18) * 0.001;
+  return clampRange(w, floor, 0.78);
+}
+function foulChance(eye, zone, twoK) {
+  let f = 0.32 + Math.max(0, 72 - eye.con) * 0.003 - Math.max(0, eye.con - 80) * 0.0018;
+  if (!zone.inZone) f += 0.08 + zone.dist * 0.1;
+  if (twoK) f += 0.08 + Math.max(0, 78 - eye.pow) * 0.0055 + Math.max(0, eye.con - 72) * 0.0024 - Math.max(0, eye.pow - 82) * 0.0025;
+  return clampRange(f, 0.14, 0.72);
+}
+function barrelChance(eye, eff, zone, early, twoK, chase) {
+  let b = 0.028 + (eye.con - 70) * 0.0024 - (eff.ctrl - 70) * 0.0011 - Math.max(0, eff.brk - 70) * 0.0009;
+  if (zone.heart) b += 0.026 + Math.max(0, eye.pow - 74) * 0.0022;
+  if (zone.heart && early && eye.pow >= 82) b += 0.022;
+  if (twoK && eye.pow < 72) b -= 0.026;
+  if (chase) b *= 0.3;
+  return clampRange(b, 0.01, 0.4);
+}
+function throwOnePitch(batter, pit, eff, balls, strikes, pitchNum, seeRct, seeCon) {
+  const thrown = deliverPitch(pit, eff.spd);
+  const kind = thrown.kind;
+  const seq = sequenceEdge(pit, eff.spd, eff.ctrl, kind);
+  const aim = pitchAim(batter.pow || 70, balls, strikes);
+  const loc = locatePitch(aim, eff, kind);
+  const zone = zoneOf(loc.x, loc.z);
+  const seen = zoneOf(loc.seenX, loc.seenZ);
+  const eye = {
+    pow: batter.pow || 70,
+    rct: seeRct != null ? seeRct : (batter.rct || 70),
+    con: seeCon != null ? seeCon : (batter.con || 70),
+    launch: batter.launch != null ? batter.launch : 12
   };
-}
-function chargeCount(pit, count, outcome) {
-  if (!pit || !count) return '';
-  let pitches = count.balls + count.strikes + 1;
-  let extra = 0;
-  if (count.full) {
-    pitches += 1;
-    extra = outcome === 'bb' ? 0.55 : 0.32;
+  const read = (eye.rct - 70) * 0.0135 - (eff.spd - 70) * 0.0062 - (eff.brk - 70) * 0.0072;
+  const twoK = strikes >= 2;
+  const early = pitchNum < 2;
+  const row = { kind: kind, flight: thrown.flight, seq: seq, x: loc.x, z: loc.z, eff: eff, zone: zone, twoK: twoK, early: early };
+  if (Math.abs(loc.x) >= 1.08 && loc.z >= 0.20 && loc.z <= 0.98) {
+    const dodge = clampRange(0.66 + (eye.rct - 70) * 0.014, 0.12, 0.94);
+    if (Math.random() > dodge) {
+      row.call = '사구'; row.result = 'hbp';
+      return row;
+    }
+    row.call = '볼'; row.result = 'ball';
+    return row;
   }
-  let cut = '';
-  if (outcome === 'bip' && count.pitcher && Math.random() < 0.62) {
-    const n = Math.random() < 0.38 ? 2 : 1;
-    pitches += n;
-    extra += n * 0.18;
-    cut = '2스트라이크 이후 파울 ' + n + '개 커트';
+  const swing = Math.random() < swingChance(eye, seen, balls, strikes, pitchNum, read);
+  if (!swing) {
+    if (zone.inZone) { row.call = '스트라이크'; row.result = 'called'; return row; }
+    const frame = catcherFrameBonus();
+    const borderP = clampRange(0.38 + frame * 16 + (eff.ctrl - 70) * 0.0035, 0.16, 0.7);
+    if (zone.border && Math.random() < borderP) { row.call = '스트라이크'; row.result = 'called'; return row; }
+    row.call = '볼'; row.result = 'ball';
+    return row;
   }
-  pit.pitches = (pit.pitches || 0) + pitches;
-  if (extra) pit.stamina = Math.max(8, pit.stamina - extra);
-  return cut;
+  const chase = !zone.inZone;
+  if (Math.random() < whiffChance(eye, eff, zone, twoK, read, kind, seq)) {
+    row.call = (!zone.inZone && zone.dist < 0.22) ? '체크스윙' : '헛스윙';
+    row.result = 'whiff';
+    row.chase = chase;
+    return row;
+  }
+  if (Math.random() < foulChance(eye, zone, twoK)) {
+    row.call = '파울'; row.result = 'foul'; row.chase = chase;
+    return row;
+  }
+  row.call = '타격';
+  row.result = 'bip';
+  row.chase = chase;
+  row.heart = !!(zone.heart && !chase);
+  row.barrel = Math.random() < barrelChance(eye, eff, zone, early, twoK, chase);
+  return row;
 }
-function countLead(count, cut, outcome) {
-  if (!count) return '';
-  let s = '카운트 ' + count.balls + '-' + count.strikes;
-  if (count.full) s += ' 풀카운트';
-  else if (outcome === 'bip' && count.hitter) s += ' 타자 유리';
-  else if (outcome === 'bip' && count.pitcher) s += ' 투수 유리';
-  else if (outcome === 'k' && count.pitcher) s += ' 투수 유리';
-  if (cut) s += ' · ' + cut;
-  return '[' + s + '] ';
+function resolveLiveCount(batter, pit, seeRct, seeCon) {
+  let balls = 0, strikes = 0;
+  const log = [];
+  let showSeq = false;
+  let pitch = null;
+  let eff = pitcherLive(pit);
+  for (let n = 1; n <= 16; n++) {
+    eff = pitcherLive(pit);
+    pitch = throwOnePitch(batter, pit, eff, balls, strikes, n - 1, seeRct, seeCon);
+    spendPitch(pit);
+    if (pitch.seq && pitch.seq.show) showSeq = true;
+    if (pitch.result === 'ball') balls++;
+    else if (pitch.result === 'called' || pitch.result === 'whiff') strikes++;
+    else if (pitch.result === 'foul' && strikes < 2) strikes++;
+    log.push({ n: n, name: pitchLabel(pitch.kind), call: pitch.call, balls: balls, strikes: strikes });
+    if (pitch.result === 'hbp') {
+      return packCount('hbp', log, pitch, eff, showSeq, null);
+    }
+    if (balls >= 4) return packCount('bb', log, pitch, eff, showSeq, null);
+    if (strikes >= 3) return packCount('k', log, pitch, eff, showSeq, null);
+    if (pitch.result === 'bip' || n === 16) {
+      const contact = {
+        con: seeCon, rct: seeRct, pow: batter.pow,
+        effSpd: eff.spd, effBrk: eff.brk, effCtrl: eff.ctrl, effStuff: eff.stuff,
+        seqKick: pitch.seq ? pitch.seq.kick : 0,
+        countHitter: balls >= 2 && strikes < 2,
+        countPitcher: strikes >= 2 && balls <= 1,
+        heart: !!pitch.heart, chase: !!pitch.chase, barrel: !!pitch.barrel,
+        twoStrike: strikes >= 2, early: n <= 2
+      };
+      return packCount('bip', log, pitch, eff, showSeq, contact);
+    }
+  }
+  return packCount('bip', log, pitch, eff, showSeq, {
+    con: seeCon, rct: seeRct, pow: batter.pow, effSpd: eff.spd, effBrk: eff.brk,
+    effCtrl: eff.ctrl, effStuff: eff.stuff, seqKick: 0, countHitter: false, countPitcher: false,
+    heart: false, chase: false, barrel: false, twoStrike: strikes >= 2, early: false
+  });
+}
+function packCount(outcome, log, pitch, eff, showSeq, contact) {
+  const swinging = pitch && (pitch.call === '헛스윙' || pitch.call === '체크스윙');
+  return {
+    outcome: outcome,
+    lead: pitchLogLine(log, outcome),
+    checkCall: outcome === 'k' && swinging ? pitch.call : '',
+    flight: pitch ? pitch.flight : 0.42,
+    showSeq: !!showSeq,
+    effCtrl: eff ? eff.ctrl : 70,
+    effStuff: eff ? eff.stuff : 70,
+    contact: contact
+  };
 }
 function noteFamiliarity(batter, pit) {
   if (!batter || !pit) return { bonus: 0, look: 1 };
@@ -1568,8 +2093,7 @@ function noteFamiliarity(batter, pit) {
   const bonus = Math.max(0, raw - Math.max(0, (mnt - 70) * 0.085));
   return { bonus: bonus, look: prev + 1 };
 }
-function sequenceEdge(pit, effSpd, effCtrl) {
-  const kind = pickPitchKind(pit);
+function sequenceEdge(pit, effSpd, effCtrl, kind) {
   const family = kind === 'fast' ? 'fast' : 'off';
   const changed = !!(pit.lastFamily && pit.lastFamily !== family);
   pit.lastFamily = family;
@@ -1587,22 +2111,24 @@ function launchBattedBall(batter, pit, effCtrl, effStuff, forceFair) {
   const con = pa && pa.con != null ? pa.con : batter.con;
   const pow = pa && pa.pow != null ? pa.pow : batter.pow;
   const launch0 = batter.launch != null ? batter.launch : 12;
-  const conGap = Math.max(0, effStuff - con);
-  const spread = Math.max(9, 21.1 + conGap * 0.16 + Math.max(0, 70 - con) * 0.32);
-  let launchAngle = randNormal(launch0 - (pit.brk - 70) * 0.12, spread);
+  const effBrk = pa && pa.effBrk != null ? pa.effBrk : (pit && pit.brk || 70);
+  const spread = Math.max(9, 21.1 + (70 - con) * 0.22 + Math.max(0, effBrk - 70) * 0.08);
+  let launchAngle = randNormal(launch0 - (effBrk - 70) * 0.12, spread);
   let slowRoll = false;
-  const mishitP = conGap * 0.0015 + Math.max(0, 66 - con) * 0.0066;
+  const command = (effCtrl - 70) * 0.55 + (effBrk - 70) * 0.45;
+  let mishitP = Math.max(0, (command - (con - 70)) * 0.0045) + Math.max(0, 68 - con) * 0.0065;
+  if (pa && pa.chase) mishitP += 0.10;
   if (mishitP > 0 && Math.random() < mishitP) {
     if (Math.random() < 0.5) launchAngle = 70 + Math.random() * 10;
     else { launchAngle = Math.random() * 4; slowRoll = true; }
   }
-  const bns = Math.max(0, (pow - effStuff) / 40);
+  const bns = Math.max(0, (pow - 70) / 48 - Math.max(0, effStuff - 70) / 70);
   if (bns > 0) {
     if (launchAngle >= 40 && launchAngle <= 52) launchAngle += (26 - launchAngle) * Math.min(1, bns);
-    else if (launchAngle >= 3 && launchAngle <= 5) { launchAngle += (9 - launchAngle) * Math.min(1, bns); slowRoll = false; }
+    else if (launchAngle >= 0 && launchAngle <= 5) { launchAngle += (9 - launchAngle) * Math.min(1, bns); slowRoll = false; }
   }
   launchAngle = Math.max(-15, Math.min(80, launchAngle));
-  const plane = contactPlane(batter, effCtrl, effStuff);
+  const plane = contactPlane(batter, effCtrl, effBrk);
   let contact = '';
   if (plane.xOffset <= -0.48) {
     contact = 'eaten';
@@ -1612,19 +2138,33 @@ function launchBattedBall(batter, pit, effCtrl, effStuff, forceFair) {
     contact = 'pushed';
   } else if (Math.abs(plane.xOffset) <= 0.14) {
     contact = 'barrel';
-    if (launchAngle > 38 && launchAngle < 52) launchAngle += (27 - launchAngle) * 0.28;
+    if (launchAngle > 38 && launchAngle < 52) launchAngle += (27 - launchAngle) * 0.12;
+  }
+  if (pa && pa.barrel && contact !== 'eaten') {
+    contact = 'barrel';
+    if (launchAngle < 8) launchAngle += (16 - launchAngle) * 0.45;
+    else if (launchAngle > 46) launchAngle += (32 - launchAngle) * 0.4;
+    slowRoll = false;
+  }
+  if (pa && pa.twoStrike && pow < 76 && contact !== 'barrel') {
+    const pull = (76 - pow) / 26;
+    if (launchAngle > 24) launchAngle -= (launchAngle - 14) * 0.5 * pull;
+    if (launchAngle < 6) { launchAngle += (9 - launchAngle) * 0.55 * pull; slowRoll = false; }
   }
   if (pa && pa.countPitcher && launchAngle > 22 && launchAngle < 40) launchAngle -= 2.2;
+  launchAngle = Math.max(-15, Math.min(80, launchAngle));
   const angleEff = (launchAngle >= 10 && launchAngle <= 22) ? 1.0 : (launchAngle > 22 && launchAngle <= 35) ? 0.95 : (launchAngle >= 0 && launchAngle < 10) ? 0.88 : (launchAngle > 35 && launchAngle <= 50) ? 0.82 : 0.70;
-  const level = (pow + effStuff) / 2;
-  const delta = level - 70;
-  const skew = delta >= 0 ? delta * TUNE.up : delta * TUNE.down;
-  let exitSpeedKmh = Math.max(58, Math.min(165, (146.6 + (pow - effStuff) * TUNE.gap + skew + (Math.random() * 10 - 5)) * angleEff));
+  const powDelta = pow - 70;
+  const powTerm = powDelta >= 0 ? Math.min(powDelta, 12) * 0.32 + Math.max(0, powDelta - 12) * 0.16 : powDelta * 0.36;
+  const stuffDrag = (effStuff - 70) * 0.34;
+  let exitSpeedKmh = Math.max(58, Math.min(165, (145.4 + powTerm - stuffDrag + (Math.random() * 10 - 5)) * angleEff));
   if (contact === 'eaten') exitSpeedKmh = Math.max(70, exitSpeedKmh * (0.62 + (plane.xOffset + 1) * 0.1));
   else if (contact === 'pushed') exitSpeedKmh *= 0.88;
-  else if (contact === 'barrel') exitSpeedKmh = Math.min(165, exitSpeedKmh + 1.2);
-  if (pa && pa.countHitter) exitSpeedKmh = Math.min(165, exitSpeedKmh + 1.8);
-  if (pa && pa.countPitcher) exitSpeedKmh *= 0.992;
+  else if (contact === 'barrel') exitSpeedKmh = Math.min(165, exitSpeedKmh + (pa && pa.barrel ? 1.6 : 0.8));
+  if (pa && pa.chase && contact !== 'barrel') exitSpeedKmh *= 0.9;
+  if (pa && pa.twoStrike && pow < 76 && contact !== 'barrel') exitSpeedKmh *= 0.94;
+  if (pa && pa.countHitter) exitSpeedKmh = Math.min(165, exitSpeedKmh + 1.4);
+  if (pa && pa.countPitcher) exitSpeedKmh *= 0.975;
   const hand = batterHand(batter);
   const pull = pullSign(hand);
   let sprayAngle = forceFair ? (Math.random() * 90 - 45) : (Math.random() * 102 - 51);
@@ -1636,7 +2176,7 @@ function launchBattedBall(batter, pit, effCtrl, effStuff, forceFair) {
     const lean = batter.con >= 78 ? 3.5 : 6.5 + Math.max(0, batter.pow - 78) * 0.35;
     sprayAngle += pull * lean;
   }
-  if (batter.pow >= 78 && sprayAngle * pull > 6) exitSpeedKmh = Math.min(165, exitSpeedKmh + 3);
+  if (batter.pow >= 78 && sprayAngle * pull > 6) exitSpeedKmh = Math.min(165, exitSpeedKmh + 1.4);
   if (launchAngle >= 10 && game.wind && !forceFair) sprayAngle += game.wind.cross * game.wind.ms * 0.55;
   if (forceFair) sprayAngle = Math.max(-44, Math.min(44, sprayAngle));
   const v0 = exitSpeedKmh / 3.6, rad = launchAngle * Math.PI / 180, vx = v0 * Math.cos(rad), vy = v0 * Math.sin(rad);
@@ -1699,6 +2239,7 @@ function makeBall(shot, showTail, fumble) {
     maxH: shot.maxH, isGrounder: shot.isGrounder, elapsed: 0,
     T_ball: viewT, T_roll: shot.T_roll || viewT, totalTime: viewT,
     h0: shot.h0, vy: shot.vy, gEff: shot.gEff, hops: !!shot.hops, hopH: shot.hopH || 0.85,
+    rollV: shot.rollV || 0, rollA: shot.rollA || 0,
     showTail: showTail, exitKmh: shot.exitSpeedKmh, distance: shot.R, fumble: !!fumble,
     bounceBack: shot.bounceBack || null, kick: shot.kick || null,
     trail: [], windup: 0, started: false, fieldAt: null, holder: null
@@ -1746,14 +2287,15 @@ function advanceRunners(basesToMove, batterObj, isWalk, removeSecond) {
   game.bases = nextBases;
   return { runs: runs, animList: animList };
 }
-function throwOutAtHome(fielder, ballX, ballY, tBall, tField) {
+function throwOutAtHome(fielder, ballX, ballY, tBall) {
   const runner = game.bases[1];
-  if (!runner || runner.spd < 70 || !fielder) return false;
-  if (Math.random() < Math.max(0, (105 - fielder.fld) * 0.0008)) return false;
-  const dist = Math.hypot(ballX, ballY);
-  const late = Math.max(0, (tField || 0) - (tBall || 0));
-  const edge = 0.10 + (fielder.fld - 70) * 0.006 - (runner.spd - 75) * 0.007 - Math.max(0, dist - 25) * 0.0025 - late * 0.08;
-  return Math.random() < Math.max(0, Math.min(0.48, edge));
+  if (!runner || !fielder) return false;
+  const release = (tBall || 0) + 0.32;
+  const flight = throwFlight(fielder, ballX, ballY, 0, 0);
+  const plan = baserunPlan(runner, 2, 4, { pit: defensePitcher(), dropAt: tBall, fly: true });
+  const tRun = arriveMeters(plan, 2 * JUDGE_BASE_M);
+  const j = judgeContest(tRun, release + flight.dur + tagSlack(runner), runner, fielder.fld, { force: false });
+  return !!(j.go && j.out);
 }
 
 function checkInningChange() {
@@ -2006,7 +2548,38 @@ function setGoals(chaserPos, tx, ty, mode) {
     if (fb) { fb.isTarget = true; fb.goalX = 19.4; fb.goalY = 19.4; }
   }
   applyOrganicBackups(chaserPos, tx, ty, mode);
+  advanceDeepCutoff(tx, ty, mode);
   stampLegs();
+}
+function markDeepBall(shot) {
+  if (!game) return;
+  if (!shot || shot.isGrounder) { game._deepBall = false; return; }
+  const land = Math.hypot(shot.targetX || 0, shot.targetY || 0);
+  game._deepBall = (shot.R || 0) >= 75 || land >= 75;
+}
+function advanceDeepCutoff(tx, ty, mode) {
+  const depth = Math.hypot(tx || 0, ty || 0);
+  const deep = depth >= 75 || !!(game && game._deepBall);
+  if (!deep) return;
+  if ((mode === 'ground' || mode === 'dp' || mode === 'home' || mode === 'pick' || mode === 'steal' || mode === 'block') && depth < 75) return;
+  const relay = game && game._relay;
+  const baseKey = (relay && relay.baseKey) || '2B';
+  const pair = relayPair(tx, (game && game._chaser) || '');
+  const cutId = (relay && relay.cutId) || pair.cut;
+  const bagId = (relay && relay.bagId) || pair.bag;
+  const cut = fielderBy(cutId);
+  const base = bagPoint(baseKey);
+  const spot = (relay && relay.spot) || (cut ? cutoffSpot(tx, ty, base, cut.fld) : null);
+  if (cut && !cut.isTarget && spot) {
+    cut.goalX = spot.x;
+    cut.goalY = spot.y;
+  }
+  const bagPos = baseKey === 'HOME' ? 'C' : (baseKey === '3B' ? '3B' : bagId);
+  const bagF = fielderBy(bagPos);
+  if (bagF && !bagF.isTarget && bagF !== cut) {
+    bagF.goalX = base.x;
+    bagF.goalY = base.y;
+  }
 }
 function legKey(x, y) {
   return (Math.round((x || 0) * 100) / 100) + ',' + (Math.round((y || 0) * 100) / 100);
@@ -2054,6 +2627,19 @@ function stampLegs() {
     f.legKey = legKey(f.goalX, f.goalY);
   });
 }
+function stampFenceRoute(f, route) {
+  if (!f || !route) return;
+  f.react = startDelay(f);
+  f.ox = f.x;
+  f.oy = f.y;
+  f.mps = moveSpeed(f);
+  f.departAt = f.react;
+  f.goalX = route.turnX;
+  f.goalY = route.turnY;
+  f.legKey = legKey(route.turnX, route.turnY);
+  f.relayLeg = { at: route.turnAt, x: route.ballX, y: route.ballY };
+  f.isTarget = true;
+}
 function moveFielders() {
   placeFielders(playElapsed);
 }
@@ -2082,13 +2668,21 @@ function placeBall(t) {
     }
   } else if (ball.bounceBack && t >= tb && t < ball.bounceBack.tWall) {
     const bb = ball.bounceBack;
-    const u = (t - tb) / Math.max(1e-4, bb.tWall - tb);
+    const span = Math.hypot(bb.wallX - landX, bb.wallY - landY);
+    let u;
+    if (ball.rollV > 0 && ball.rollA > 0) u = Math.max(0, Math.min(1, rollMeters(ball.rollV, ball.rollA, t - tb) / Math.max(0.05, span)));
+    else u = (t - tb) / Math.max(1e-4, bb.tWall - tb);
     x = landX + (bb.wallX - landX) * u;
     y = landY + (bb.wallY - landY) * u;
-    h = Math.sin(Math.min(1, Math.max(0, u)) * Math.PI) * 0.85;
+    const hopT = 0.42;
+    const dt = t - tb;
+    h = dt < hopT ? Math.sin((dt / hopT) * Math.PI) * 0.62 : 0;
   } else if (ball.bounceBack && t >= ball.bounceBack.tWall && t < ball.bounceBack.tBack) {
     const bb = ball.bounceBack;
-    const u = (t - bb.tWall) / Math.max(1e-4, bb.tBack - bb.tWall);
+    const span = bb.dist > 0 ? bb.dist : Math.hypot(bb.x - bb.wallX, bb.y - bb.wallY);
+    let u;
+    if (bb.v > 0 && bb.a > 0) u = Math.max(0, Math.min(1, rollMeters(bb.v, bb.a, t - bb.tWall) / Math.max(0.05, span)));
+    else u = (t - bb.tWall) / Math.max(1e-4, bb.tBack - bb.tWall);
     x = bb.wallX + (bb.x - bb.wallX) * u;
     y = bb.wallY + (bb.y - bb.wallY) * u;
     h = Math.sin(Math.min(1, Math.max(0, u)) * Math.PI) * 1.35;
@@ -2103,10 +2697,18 @@ function placeBall(t) {
     const z = ball.isGrounder ? null : flightZ(ball.vy, ball.gEff, ball.h0, t);
     h = ball.isGrounder ? Math.max(0, (1 - p) * 0.35) : (z == null ? Math.sin(p * Math.PI) * ball.maxH : z);
   } else if (t >= tb && ball.rolls && ball.T_roll > tb) {
-    const u = Math.min(1, (t - tb) / (ball.T_roll - tb));
+    let u;
+    if (ball.rollV > 0 && ball.rollA > 0) {
+      const span = Math.hypot(ball.rollX - landX, ball.rollY - landY);
+      u = Math.max(0, Math.min(1, rollMeters(ball.rollV, ball.rollA, t - tb) / Math.max(0.05, span)));
+    } else u = Math.min(1, (t - tb) / (ball.T_roll - tb));
     x = landX + (ball.rollX - landX) * u;
     y = landY + (ball.rollY - landY) * u;
-    h = ball.hops ? Math.sin(Math.min(1, u) * Math.PI) * (ball.hopH || 0.85) : 0;
+    if (ball.hops && ball.rollV > 0) {
+      const hopT = Math.min(0.5, Math.max(0.22, (ball.T_roll - tb) * 0.28));
+      const dt = t - tb;
+      h = dt < hopT ? Math.sin((dt / hopT) * Math.PI) * (ball.hopH || 0.55) : 0;
+    } else h = ball.hops ? Math.sin(Math.min(1, u) * Math.PI) * (ball.hopH || 0.85) : 0;
   } else if (t >= tb) {
     x = landX;
     y = landY;
@@ -2153,6 +2755,204 @@ function tagSlack(runner) {
   const hot = Math.max(0, Math.min(1, (Math.min(rct, spd) - 70) / 16));
   return TAG_ACT - hot * SLIDE_ACT;
 }
+
+// [절대 불변 원칙 제5조] 전 베이스 Δt 접전. 이 창·보너스·정지 확률은 지우거나 우회하지 않는다.
+const CONTEST_EDGE = 0.15;
+const FLD_ASSIST_MAX = 0.12;
+const BASE_KEY = ['HOME', '1B', '2B', '3B', 'HOME'];
+
+function clockTick(sec) {
+  if (typeof sec !== 'number' || !isFinite(sec)) return sec;
+  return Math.round(sec * 100) / 100;
+}
+function rctHoldRate(rct) {
+  const raw = Number(rct);
+  const r = isNaN(raw) ? 70 : raw;
+  if (r <= 50) return 0.20;
+  if (r >= 90) return 0.80;
+  if (r <= 70) return 0.20 + (r - 50) * (0.30 / 20);
+  return 0.50 + (r - 70) * (0.30 / 20);
+}
+function fldAssistCut(fld) {
+  const raw = Number(fld);
+  const f = isNaN(raw) ? 70 : raw;
+  const cut = (f - 50) * (FLD_ASSIST_MAX / 40);
+  if (cut <= 0) return 0;
+  if (cut >= FLD_ASSIST_MAX) return FLD_ASSIST_MAX;
+  return clockTick(cut);
+}
+function judgeContest(tRun, tDef, runner, fld, opts) {
+  opts = opts || {};
+  const tr = clockTick(tRun);
+  const td = clockTick(tDef);
+  const dt = clockTick(td - tr);
+  const row = {
+    dt: dt, tRun: tr, tDef: td, tLive: td, cut: 0,
+    go: false, out: false, hold: false, assist: false, kind: 'hold', force: !!opts.force
+  };
+  if (!isFinite(tr) || !isFinite(td)) {
+    row.hold = !opts.force;
+    row.go = !!opts.force;
+    row.out = !!opts.force;
+    row.kind = opts.force ? 'out' : 'hold';
+    return row;
+  }
+  if (dt > CONTEST_EDGE) {
+    row.go = true;
+    row.kind = 'safe';
+    return row;
+  }
+  if (dt < -CONTEST_EDGE) {
+    if (opts.force) {
+      row.go = true;
+      row.out = true;
+      row.kind = 'out';
+      return row;
+    }
+    row.hold = true;
+    row.kind = 'hold';
+    return row;
+  }
+  if (dt >= 0) {
+    const cut = fldAssistCut(fld);
+    const floor = opts.floor;
+    let live = clockTick(td - cut);
+    if (floor != null && isFinite(floor) && live < floor) live = clockTick(floor);
+    const applied = clockTick(Math.max(0, td - live));
+    row.cut = applied;
+    row.tLive = live;
+    row.go = true;
+    row.out = live < tr;
+    row.assist = row.out && applied > 0;
+    row.kind = row.out ? (row.assist ? 'assist' : 'out') : 'safe';
+    return row;
+  }
+  if (opts.force) {
+    row.go = true;
+    row.out = true;
+    row.kind = 'out';
+    return row;
+  }
+  const hold = Math.random() < rctHoldRate(runner && runner.rct);
+  row.go = !hold;
+  row.out = !hold;
+  row.hold = hold;
+  row.kind = hold ? 'read' : 'cs';
+  return row;
+}
+function noteAdvanceOut(kind) {
+  if (!game) return;
+  const atk = game.isTop ? game.away : game.home;
+  bump(atk, 'to', 1);
+  if (kind === 'assist') bump(atk, 'assist', 1);
+}
+function noteSteal(safe, kind) {
+  if (!game) return;
+  const atk = game.isTop ? game.away : game.home;
+  if (safe) bump(atk, 'sb', 1);
+  else {
+    bump(atk, 'cs', 1);
+    bump(atk, 'to', 1);
+    if (kind === 'assist') bump(atk, 'assist', 1);
+  }
+}
+let pendingHomeDrop = null;
+function resetHomeDrop() { pendingHomeDrop = null; }
+function defenseRoute(who, x, y, release, base, fldFallback) {
+  const key = BASE_KEY[Math.max(0, Math.min(4, base))];
+  const fld = fldFallback == null ? (who ? who.fld : 70) : fldFallback;
+  const route = who
+    ? relayOrDirect(who, x, y, release, key)
+    : {
+      relay: null, baseKey: key, x: x, y: y, rel: release, fld: fld,
+      t: throwArriveAt(base >= 4 ? 4 : base, x, y, release, fld, null)
+    };
+  if (base >= 4 && who && who.isOF && !route.relay) {
+    if (!pendingHomeDrop || pendingHomeDrop.who !== who) {
+      const flight = throwFlight(who, x, y, 0, 0);
+      const drop = !!(flight.bounce && Math.random() < oneBounceMiss(fielderBy('C')));
+      pendingHomeDrop = { who: who, flight: flight, drop: drop, charged: false };
+    }
+    route.rel = release;
+    route.t = release + (pendingHomeDrop.drop ? 99 : pendingHomeDrop.flight.dur);
+    route.dur = pendingHomeDrop.flight.dur;
+    route.bounce = pendingHomeDrop.flight.bounce && !pendingHomeDrop.drop;
+    route.drop = pendingHomeDrop.drop;
+    route.arm = pendingHomeDrop.flight.arm;
+    if (pendingHomeDrop.drop && !pendingHomeDrop.charged && game) {
+      chargeError(game.isTop ? game.home : game.away);
+      pendingHomeDrop.charged = true;
+    }
+  }
+  return route;
+}
+function planTo(runner, from, dest, read, isOut) {
+  const to = Math.max(from, dest);
+  const plan = baserunPlan(runner, from, to, read);
+  if (to - from >= 2) plan.roundM = ROUND_BULGE;
+  if (!isOut && from === 0 && to === 1) plan.overrunM = OVERRUN_M;
+  return plan;
+}
+function chainRunner(runner, from, minDest, maxDest, read, who, x, y, release, fldFallback, front) {
+  let dest = from;
+  let outBase = 0;
+  let stop = null;
+  let close2 = false;
+  const cap = maxDest == null ? 4 : maxDest;
+  const floor = minDest == null ? from : minDest;
+  for (let base = from + 1; base <= cap; base++) {
+    const plan = baserunPlan(runner, from, base, read);
+    const meters = (base - from) * JUDGE_BASE_M;
+    const tRun = front ? arriveBlocked(plan, meters, front) : arriveMeters(plan, meters);
+    const route = defenseRoute(who, x, y, release, base, fldFallback);
+    const forced = base <= floor;
+    const tDef = route.t + (forced ? 0 : tagSlack(runner));
+    const j = judgeContest(tRun, tDef, runner, route.fld, { force: forced });
+    j.base = base;
+    j.route = route;
+    if (base === 2 && Math.abs(j.dt) <= CONTEST_EDGE + 1e-9 && j.go) close2 = true;
+    stop = j;
+    if (!j.go) break;
+    dest = base;
+    if (j.out) {
+      outBase = base;
+      break;
+    }
+  }
+  const landed = outBase || dest;
+  return {
+    runner: runner, from: from, dest: outBase ? 0 : dest, outBase: outBase,
+    stop: stop, close2: close2, plan: planTo(runner, from, landed, read, !!outBase),
+    tEvent: stop ? stop.tRun : 0
+  };
+}
+function queueContestThrow(who, spec) {
+  if (!spec || !spec.route || !who) return;
+  const route = spec.route;
+  const cut = spec.judge && spec.judge.cut ? spec.judge.cut : 0;
+  const key = route.baseKey || '2B';
+  if (route.relay) {
+    const relay = route.relay;
+    queueThrow({
+      from: who.pos, toPos: relay.cutId, x0: spec.x, y0: spec.y, x1: relay.spot.x, y1: relay.spot.y,
+      release: spec.release, dur: relay.flight1, arm: relay.arm1
+    });
+    queueThrow({
+      from: relay.cutId, to: key, toPos: key === 'HOME' ? 'C' : (key === '3B' ? '3B' : relay.bagId),
+      x0: relay.spot.x, y0: relay.spot.y, release: route.rel - cut,
+      arm: armMetersPerSec(relay.cut ? relay.cut.fld : route.fld)
+    });
+    if (game) game._relay = { cutId: relay.cutId, bagId: relay.bagId, spot: relay.spot, baseKey: key };
+    return;
+  }
+  const bag = bagPoint(key);
+  const dropped = !!route.drop;
+  queueThrow({
+    from: who.pos, to: key, x0: spec.x, y0: spec.y, x1: dropped ? 8 : bag.x, y1: dropped ? -4 : bag.y,
+    release: route.rel - (dropped ? 0 : cut), dur: route.dur || Math.max(1e-4, route.t - route.rel),
+    arm: route.arm || armMetersPerSec(route.fld), wild: dropped, bounce: !!route.bounce
+  });
+}
 function baserunPlan(runner, from, to, read) {
   read = read || {};
   const pit = read.pit || defensePitcher();
@@ -2174,8 +2974,62 @@ function baserunPlan(runner, from, to, read) {
     plan.holdM = HALFWAY_M;
     plan.goAt = read.dropAt;
   }
-  if (to - from >= 2) plan.roundM = ROUND_BULGE;
+  if (to - from >= 2) {
+    plan.roundM = ROUND_BULGE;
+    plan.topSpeed = topRunMetersPerSec(runner ? runner.spd : 70);
+  }
   return plan;
+}
+function multiCruise(plan) {
+  if (!plan || plan.retreat || !(plan.topSpeed > 0)) return false;
+  if ((plan.targetIdx - plan.startIdx) < 2) return false;
+  if (plan.holdM != null && plan.goAt != null) return false;
+  return true;
+}
+function cruisePathSpeed(top) {
+  const v1 = top > 1e-4 ? top : 1e-4;
+  return v1 * JUDGE_BASE_M / (JUDGE_BASE_M + ROUND_STEP_M);
+}
+function timeAlong(plan, meters) {
+  const v0 = plan.speed > 1e-4 ? plan.speed : 1e-4;
+  const v1 = plan.topSpeed > 1e-4 ? plan.topSpeed : v0;
+  const delay = plan.delay || 0;
+  const lead = Math.max(0, plan.leadM || 0);
+  const bag = JUDGE_BASE_M;
+  const fromBox = plan.startIdx === 0 && lead < 0.4;
+  const vEff = cruisePathSpeed(v1);
+  if (fromBox) {
+    const accelEnd = Math.min(bag, ACCEL_WINDOW_M);
+    if (meters <= accelEnd) return delay + meters / v0;
+    const tAccel = delay + accelEnd / v0;
+    if (meters <= bag) return tAccel + (meters - accelEnd) / v1;
+    const tBag = tAccel + (bag - accelEnd) / v1;
+    return tBag + (meters - bag) / vEff;
+  }
+  if (meters <= bag) return delay + Math.max(0, meters - lead) / v0;
+  const tBag = delay + Math.max(0, bag - lead) / v0;
+  return tBag + (meters - bag) / vEff;
+}
+function metersAlong(plan, t) {
+  const v0 = plan.speed > 1e-4 ? plan.speed : 1e-4;
+  const v1 = plan.topSpeed > 1e-4 ? plan.topSpeed : v0;
+  const delay = plan.delay || 0;
+  const lead = Math.max(0, plan.leadM || 0);
+  if (t <= delay) return lead;
+  const bag = JUDGE_BASE_M;
+  const fromBox = plan.startIdx === 0 && lead < 0.4;
+  const vEff = cruisePathSpeed(v1);
+  if (fromBox) {
+    const accelEnd = Math.min(bag, ACCEL_WINDOW_M);
+    const tAccel = delay + accelEnd / v0;
+    if (t <= tAccel) return v0 * (t - delay);
+    const tBag = tAccel + (bag - accelEnd) / v1;
+    if (t <= tBag) return accelEnd + v1 * (t - tAccel);
+    return bag + vEff * (t - tBag);
+  }
+  const tBag = delay + Math.max(0, bag - lead) / v0;
+  if (t <= tBag) return lead + v0 * (t - delay);
+  return bag + vEff * (t - tBag);
 }
 function travelCap(plan) {
   if (!plan) return 0;
@@ -2198,7 +3052,7 @@ function arriveMeters(plan, meters) {
     if (goAt <= tHold) return delay + (meters - lead) / spd;
     return goAt + (meters - hold) / spd;
   }
-  const t = delay + (meters - lead) / spd;
+  const t = multiCruise(plan) ? timeAlong(plan, meters) : delay + (meters - lead) / spd;
   if (plan.freezeAt != null && t > plan.freezeAt + 1e-6) return Infinity;
   return t;
 }
@@ -2237,6 +3091,7 @@ function forwardMeters(r, t) {
       if (t <= delay) return lead;
       return Math.max(0, lead - spd * (t - delay));
     }
+    if (multiCruise(r)) return metersAlong(r, t);
     return t <= delay ? lead : lead + spd * (t - delay);
   }
   const tHold = delay + Math.max(0, hold - lead) / spd;
@@ -2360,12 +3215,7 @@ function throwArriveAt(toBase, x, y, release, fld, durOverride) {
   const bag = baseCoords[Math.max(0, Math.min(4, toBase))];
   return release + Math.hypot(bag.x - x, bag.y - y) / armMetersPerSec(fld);
 }
-function wantExtra(from, to, ballX, ballY) {
-  if (from === 1 && to === 3) {
-    if (ballX < -25) return false;
-    if (ballX > 25) return true;
-    return Math.hypot(-19.4 - ballX, 19.4 - ballY) >= 52;
-  }
+function wantExtra() {
   return true;
 }
 function catcherRead(c) {
@@ -2821,72 +3671,81 @@ function resolveFirstThirdSteal(atk, def, r1, r3, pit) {
   const c = fielderBy('C');
   const iq = catcherRead(c);
   const protect = iq >= 70;
-  const jump = (r1.rct - 70) * 0.004;
-  const stealDelay = Math.max(0.08, 0.22 - jump);
-  const speed1 = runMetersPerSec(r1.spd);
-  const cArm = armMetersPerSec(c ? c.fld : 70);
-  const quick = quickMotionDelay(pit);
-  const runT = stealDelay + JUDGE_BASE_M / speed1;
+  const tl = stealTimeline(pit, c, r1);
   const slack = tagSlack(r1);
   const lead3 = dynamicLead(r3, pit);
+  const cArm = armMetersPerSec(c ? c.fld : 70);
   if (protect) {
     const cutD = 18.4 - (-1.5);
-    const cutT = quick + cutD / cArm;
+    const cutFlight = cutD / cArm;
+    const cutRelease = tl.receive + 0.16;
+    const cutT = cutRelease + cutFlight;
     const mound = fielderBy('P');
     const pArm = armMetersPerSec(mound ? mound.fld : 70);
     const relayD = 38.8 - 18.4;
     const relayRelease = cutT + 0.22;
     const relayDur = relayD / pArm;
-    const caught = relayRelease + relayDur + slack <= runT;
+    const throwArrive = relayRelease + relayDur;
+    const jCut = judgeContest(tl.runT, throwArrive + slack, r1, mound ? mound.fld : 70, { force: false });
+    if (!jCut.go) return null;
+    const liveRelay = relayRelease - (jCut.cut || 0);
     setGoals(null, 0, 38.8, 'steal');
+    armStealPitch(pit, tl.quick, tl.flight);
     queueThrow({
       from: 'C', to: 'P', x0: 0, y0: -1.5, x1: 0, y1: 18.4, wild: false, needsCatch: false,
-      release: quick, dur: cutD / cArm, arm: cArm
+      release: cutRelease, dur: cutFlight, arm: cArm
     });
     queueThrow({
       from: 'P', to: '2B', toPos: '2B', x0: 0, y0: 18.4, x1: 0, y1: 38.8, wild: false, needsCatch: false,
-      release: relayRelease, dur: relayDur, arm: pArm
+      release: liveRelay, dur: relayDur, arm: pArm
     });
     runnersAnim = [
-      { startIdx: 1, targetIdx: 2, speed: speed1, delay: stealDelay, who: r1 },
+      { startIdx: 1, targetIdx: 2, speed: tl.speed, delay: tl.delay, leadM: tl.lead, who: r1 },
       { startIdx: 3, targetIdx: 3, speed: runMetersPerSec(r3.spd), delay: 0, leadM: lead3, who: r3, holdM: Math.min(5.5, HALFWAY_M), goAt: cutT, retreat: true }
     ];
-    if (caught) {
+    noteBaseRace('2B', jCut.tRun, jCut.tLive);
+    if (jCut.out) {
+      noteSteal(false, jCut.kind);
       grantOuts(1);
       game.bases[0] = null;
       playCaption = { text: '컷오프 도루 저지!', bad: true };
-      return { msg: '🧤 1·3루. 포수가 3루 주자를 보고 투수에게 컷. ' + r3.name + '은 귀루, ' + r1.name + '은 2루 태그 아웃.', dur: 1.55 };
+      return { msg: '🧤 1·3루. 포수가 3루 주자를 보고 투수에게 컷. ' + r3.name + '은 귀루, ' + r1.name + '은 2루 태그 아웃.', dur: throwArrive + 0.35 };
     }
+    noteSteal(true);
     game.bases[1] = r1;
     game.bases[0] = null;
     playCaption = { text: '컷오프, 2루 세이프', bad: false };
-    return { msg: '👀 포수 수비·판단으로 2루 송구를 끊었습니다. ' + r1.name + ' 2루 세이프, ' + r3.name + '은 3루 잔류.', dur: 1.55 };
+    return { msg: '👀 포수 수비·판단으로 2루 송구를 끊었습니다. ' + r1.name + ' 2루 세이프, ' + r3.name + '은 3루 잔류.', dur: throwArrive + 0.35 };
   }
-  const stealD = Math.hypot(0, 38.8 - (-1.5));
-  const throwT = quick + stealD / cArm;
-  const caught = throwT + slack <= runT;
-  const homeDelay = quick + 0.12;
+  const jSteal = judgeContest(tl.runT, tl.arrive + slack, r1, c ? c.fld : 70, { force: false });
+  if (!jSteal.go) return null;
+  const stealRelease = tl.release - (jSteal.cut || 0);
+  const homeDelay = tl.receive + 0.15;
   setGoals(null, 0, 38.8, 'steal');
+  armStealPitch(pit, tl.quick, tl.flight);
   queueThrow({
     from: 'C', to: '2B', toPos: '2B', x0: 0, y0: -1.5, x1: 0, y1: 38.8, wild: false, needsCatch: false,
-    release: quick, dur: stealD / cArm, arm: cArm
+    release: stealRelease, dur: tl.throwDur, arm: cArm
   });
   runnersAnim = [
-    { startIdx: 1, targetIdx: 2, speed: speed1, delay: stealDelay, who: r1 },
+    { startIdx: 1, targetIdx: 2, speed: tl.speed, delay: tl.delay, leadM: tl.lead, who: r1 },
     { startIdx: 3, targetIdx: 4, speed: runMetersPerSec(r3.spd), delay: homeDelay, leadM: lead3, who: r3 }
   ];
+  noteBaseRace('2B', jSteal.tRun, jSteal.tLive);
   addRuns(atk, def, 1);
   game.bases[2] = null;
-  if (caught) {
+  if (jSteal.out) {
+    noteSteal(false, jSteal.kind);
     grantOuts(1);
     game.bases[0] = null;
     playCaption = { text: '2루 아웃, 홈인', bad: true };
-    return { msg: '💨 포수가 2루 송구를 선택. ' + r1.name + ' 태그 아웃, ' + r3.name + '은 홈인.', dur: 1.55 };
+    return { msg: '💨 포수가 2루 송구를 선택. ' + r1.name + ' 태그 아웃, ' + r3.name + '은 홈인.', dur: (tl.arrive - (jSteal.cut || 0)) + 0.35 };
   }
+  noteSteal(true);
   game.bases[1] = r1;
   game.bases[0] = null;
   playCaption = { text: '더블 스틸!', bad: false };
-  return { msg: '💨 1·3루 더블 스틸! ' + r1.name + ' 2루, ' + r3.name + ' 홈인.', dur: 1.55 };
+  return { msg: '💨 1·3루 더블 스틸! ' + r1.name + ' 2루, ' + r3.name + ' 홈인.', dur: tl.arrive + 0.35 };
 }
 function resolveSidePlay(atk, def) {
   const r1 = game.bases[0];
@@ -2918,62 +3777,76 @@ function resolveSidePlay(atk, def) {
     return { msg: '👀 1루 견제구. ' + r1.name + ' 귀루. 리드를 줄입니다.', dur: 1.05 };
   }
   if (r1.spd >= 70 && !game.bases[1] && game.outs < 2 && Math.random() < 0.11 + (r1.spd - 70) * 0.007) {
-    if (game.bases[2]) return resolveFirstThirdSteal(atk, def, r1, game.bases[2], pit);
+    armDeliveredPitch(pit, pitcherLive(pit).spd);
+    if (game.bases[2]) {
+      const dbl = resolveFirstThirdSteal(atk, def, r1, game.bases[2], pit);
+      if (dbl) { spendPitch(pit); pit._armed = false; }
+      return dbl;
+    }
     const c = fielderBy('C');
-    const jump = (r1.rct - 70) * 0.004;
-    const stealDelay = Math.max(0.08, 0.22 - jump);
+    const tl = stealTimeline(pit, c, r1);
+    const j = judgeContest(tl.runT, tl.arrive + tagSlack(r1), r1, c ? c.fld : 70, { force: false });
+    if (!j.go) return null;
+    spendPitch(pit);
+    pit._armed = false;
     const cArm = armMetersPerSec(c ? c.fld : 70);
-    const stealD = Math.hypot(0, 38.8 - (-1.5));
-    const quick = quickMotionDelay(pit);
-    const runT = stealDelay + 27.43 / statMetersPerSec(r1.spd);
-    const throwT = quick + stealD / cArm;
-    const margin = (throwT + tagSlack(r1)) - runT;
-    const caught = margin <= 0;
+    const release = tl.release - (j.cut || 0);
+    armStealPitch(pit, tl.quick, tl.flight);
     setGoals(null, 0, 38.8, 'steal');
-    runnersAnim = [{ startIdx: 1, targetIdx: 2, speed: runMetersPerSec(r1.spd), delay: stealDelay }];
+    runnersAnim = [{ startIdx: 1, targetIdx: 2, speed: tl.speed, delay: tl.delay, leadM: tl.lead, who: r1 }];
     queueThrow({
       from: 'C', to: '2B', toPos: '2B', x0: 0, y0: -1.5, x1: 0, y1: 38.8, wild: false, needsCatch: false,
-      release: quick, dur: stealD / cArm, arm: cArm
+      release: release, dur: tl.throwDur, arm: cArm
     });
-    if (caught) {
+    noteBaseRace('2B', j.tRun, j.tLive);
+    if (j.out) {
+      noteSteal(false, j.kind);
       grantOuts(1);
       game.bases[0] = null;
       playCaption = { text: '도루 저지!', bad: true };
-      return { msg: '🚫 도루 저지! 포수가 ' + Math.abs(margin).toFixed(2) + '초 빨랐습니다. 2루 커버.', dur: 1.45 };
+      return { msg: '🚫 도루 저지! 포수가 ' + Math.abs(j.dt).toFixed(2) + '초 빨랐습니다. 2루 커버.', dur: j.tLive + 0.35 };
     }
+    noteSteal(true);
     game.bases[1] = r1;
     game.bases[0] = null;
     playCaption = { text: '도루 성공!', bad: false };
-    return { msg: '💨 ' + r1.name + ' 도루 성공! 주자가 ' + Math.max(0.01, margin).toFixed(2) + '초 앞섰습니다.', dur: 1.45 };
+    return { msg: '💨 ' + r1.name + ' 도루 성공! 주자가 ' + Math.max(0.01, j.dt).toFixed(2) + '초 앞섰습니다.', dur: j.tLive + 0.35 };
   }
   return null;
 }
 function samplePitch() {
   if (!pitchFx) return;
-  const u = Math.min(1, pitchFx.t / pitchFx.dur);
-  const pt = pitchPoint(pitchFx.kind, u);
+  const rel = pitchFx.releaseAt || 0;
+  const flight = Math.max(1e-4, (pitchFx.dur || 0.36) - rel);
+  const u = pitchFx.t <= rel ? 0 : Math.min(1, (pitchFx.t - rel) / flight);
+  const pt = pitchPoint(pitchFx.kind, u, pitchFx.bend);
   pitchFx.x = pt.x;
   pitchFx.y = pt.y;
   pitchFx.trail.push([pt.x, pt.y]);
   if (pitchFx.trail.length > 14) pitchFx.trail.shift();
 }
-function pitchPoint(kind, u) {
+function pitchPoint(kind, u, bend) {
+  const b = bend > 0 ? bend : 1;
   const t = kind === 'drop' ? u * u : u;
   const x0 = 0, y0 = 18.4, x1 = 0.15, y1 = 0.35;
   let cx = 0.3, cy = 10;
-  if (kind === 'break') { cx = 6.6; cy = 8.6; }
-  if (kind === 'drop') { cx = 1.3; cy = 6.4; }
+  if (kind === 'break') { cx = 6.6 * b; cy = 8.6; }
+  if (kind === 'drop') { cx = 1.3 * b; cy = 7.4 - 1.5 * b; }
   return {
     x: (1 - t) * (1 - t) * x0 + 2 * (1 - t) * t * cx + t * t * x1,
     y: (1 - t) * (1 - t) * y0 + 2 * (1 - t) * t * cy + t * t * y1
   };
 }
 function creditHit(atk, batter, bases) {
+  const n = bases >= 4 ? 4 : bases;
   batter.h++;
   atk.hits++;
-  if (bases === 4) batter.hr++;
-  bump(atk, 'tb', bases);
-  touchHeat(batter, bases);
+  if (n === 1) bump(atk, 's1', 1);
+  else if (n === 2) bump(atk, 'd2', 1);
+  else if (n === 3) bump(atk, 't3', 1);
+  else if (n === 4) { batter.hr++; bump(atk, 'hr', 1); }
+  bump(atk, 'tb', n);
+  touchHeat(batter, n);
 }
 function resolveWildPitch(atk, def) {
   if (!game.bases[0] && !game.bases[1] && !game.bases[2]) return null;
@@ -3071,6 +3944,7 @@ function resolveBunt(atk, def, batter, pit) {
   const release = fieldT + 0.32;
   let msg = '';
   let sacFail = false;
+  let buntCut = 0;
   if (sac) {
     const ok = Math.random() < Math.max(0.55, Math.min(0.9, 0.74 + (batQ - hands) * 0.004));
     if (ok) {
@@ -3104,8 +3978,10 @@ function resolveBunt(atk, def, batter, pit) {
   } else {
     const throwT = release + Math.hypot(19.4 - shotX, 19.4 - shotY) / bArm;
     const runT = 0.32 + 27.43 / runMetersPerSec(batter.spd);
+    const jB = judgeContest(runT, throwT, batter, fielder ? fielder.fld : 70, { force: true });
+    buntCut = jB.cut || 0;
     batter.ab++;
-    if (runT < throwT) {
+    if (!jB.out) {
       creditHit(atk, batter, 1);
       const res = advanceRunners(1, batter, false);
       addRuns(atk, def, res.runs);
@@ -3131,7 +4007,7 @@ function resolveBunt(atk, def, batter, pit) {
     from: fielder ? fielder.pos : 'P', to: sacFail ? '3B' : '1B',
     toPos: (sacFail && fielder && fielder.pos === '3B') ? 'SS' : null,
     x0: shotX, y0: shotY, x1: destX, y1: destY,
-    release: release, dur: Math.hypot(destX - shotX, destY - shotY) / bArm, arm: bArm
+    release: release - buntCut, dur: Math.hypot(destX - shotX, destY - shotY) / bArm, arm: bArm
   });
   setGoals(fielder ? fielder.pos : 'P', shotX, shotY, 'ground');
   ball = makeBall(shot, false, false);
@@ -3164,7 +4040,6 @@ function resolveDroppedThird(batter, pit, atk, def, checkCall) {
     });
     setGoals('1B', 19.4, 19.4, 'pick');
     playCaption = { text: '낫아웃 세이프!', bad: false };
-    armSlow(19.4, 19.4);
     return { msg: '🏃 낫아웃! 3스트라이크 공이 빠졌고 ' + batter.name + '이 1루까지 전력 질주해 세이프.' + (checkCall ? ' (체크스윙)' : '') + (res.runs ? ' ' + res.runs + '득점!' : '') };
   }
   grantOuts(1);
@@ -3176,7 +4051,6 @@ function resolveDroppedThird(batter, pit, atk, def, checkCall) {
   runnersAnim = [{ startIdx: 0, targetIdx: 1, speed: runMetersPerSec(batter.spd), delay: 0.25 }];
   setGoals('1B', 19.4, 19.4, 'pick');
   playCaption = { text: '낫아웃 아웃!', bad: true };
-  armSlow(19.4, 19.4);
   return { msg: '🚫 낫아웃! 포수 1루 송구로 ' + batter.name + ' 아웃.' + (checkCall ? ' (체크스윙 헛스윙)' : '') };
 }
 function layFielderChoice(batter, bestF, shot, arm) {
@@ -3221,7 +4095,8 @@ function canBeatThrow(spd, fromBase, toBase, x, y, release, fld, durOverride, ru
   let tThrow = throwArriveAt(toBase, x, y, release, fld, durOverride);
   const force = timing.force != null ? timing.force : (toBase === 1 && fromBase === 0);
   if (!force) tThrow += tagSlack(who);
-  return tRun < tThrow;
+  const j = judgeContest(tRun, tThrow, who, fld, { force: force });
+  return j.go && !j.out;
 }
 function batterSafeBases(spd, x, y, release, fld, batter, timing) {
   let n = 1;
@@ -3231,13 +4106,42 @@ function batterSafeBases(spd, x, y, release, fld, batter, timing) {
   }
   return n;
 }
+function readStretchDouble(batter, fieldAt, release, throwArrive) {
+  const speed = Math.max(0.1, runMetersPerSec(batter ? batter.spd : 70));
+  const tDecision = Math.max(0, JUDGE_BASE_M - 3) / speed;
+  const t2 = (2 * JUDGE_BASE_M) / speed;
+  const runTimeTo2B = t2 - tDecision;
+  const caught = fieldAt == null ? release : fieldAt;
+  const turnDelay = Math.max(0, release - caught);
+  const catchRemain = Math.max(0, caught - tDecision);
+  const turnRemain = tDecision >= release ? 0 : Math.max(0, (caught + turnDelay) - Math.max(tDecision, caught));
+  const flightRemain = Math.max(0, throwArrive - Math.max(tDecision, release));
+  const totalThrowTimeTo2B = catchRemain + turnRemain + flightRemain;
+  const j = judgeContest(t2, throwArrive + tagSlack(batter), batter, 70, { force: false });
+  return {
+    go: j.go && !j.out,
+    t2: t2,
+    throwArrive: throwArrive,
+    runTimeTo2B: runTimeTo2B,
+    totalThrowTimeTo2B: totalThrowTimeTo2B,
+    margin: j.dt
+  };
+}
+function reachOnMiss(row, read) {
+  if (!row || !row.outBase) return;
+  row.dest = row.outBase;
+  row.outBase = 0;
+  row.tEvent = 0;
+  row.plan = planTo(row.runner, row.from, row.dest, read, false);
+}
 function settleHit(atk, def, batter, n, x, y, release, fld, homeOutRunner, homeDur, opts) {
   opts = opts || {};
-  n = Math.max(1, Math.min(4, n));
-  creditHit(atk, batter, n);
+  resetHomeDrop();
   const pit = opts.pit || defensePitcher();
-  const ballX = opts.ballX != null ? opts.ballX : x;
-  const ballY = opts.ballY != null ? opts.ballY : y;
+  const gx = opts.gloveX != null ? opts.gloveX : x;
+  const gy = opts.gloveY != null ? opts.gloveY : y;
+  const gr = opts.gloveRel != null ? opts.gloveRel : release;
+  const who = opts.who || null;
   let leadFrom = 0;
   for (let li = 2; li >= 0; li--) {
     if (game.bases[li] && !(homeOutRunner && game.bases[li] === homeOutRunner)) { leadFrom = li + 1; break; }
@@ -3252,51 +4156,159 @@ function settleHit(atk, def, batter, n, x, y, release, fld, homeOutRunner, homeD
     uncatchable: !!opts.uncatchable,
     leadFrom: leadFrom
   };
-  const anim = [];
-  const batterPlan = baserunPlan(batter, 0, Math.min(4, n), read);
-  if (n === 1) batterPlan.overrunM = OVERRUN_M;
-  if (n >= 2) batterPlan.roundM = ROUND_BULGE;
-  anim.push(batterPlan);
-  const next = [null, null, null];
-  const taken = {};
-  let runs = n >= 4 ? 1 : 0;
-  let front = null;
-  for (let i = 2; i >= 0; i--) {
-    const r = game.bases[i];
-    if (!r) continue;
+  const chain = !!opts.chain;
+  const lock = chain ? null : (opts.lockBatter != null ? opts.lockBatter : Math.max(1, Math.min(4, n || 1)));
+  let batterRow;
+  if (lock != null) {
+    batterRow = {
+      runner: batter, from: 0, dest: lock, outBase: 0, stop: null, close2: false,
+      plan: planTo(batter, 0, lock, read, false), tEvent: 0
+    };
+  } else {
+    batterRow = chainRunner(batter, 0, 1, 4, read, who, gx, gy, gr, fld, null);
+  }
+  const slots = [game.bases[0], game.bases[1], game.bases[2]];
+  const stay = opts.stayAt || null;
+  let wave = batterRow.outBase ? Math.max(0, batterRow.outBase - 1) : batterRow.dest;
+  const mins = [0, 0, 0];
+  for (let i = 0; i < 3; i++) {
+    if (!slots[i]) continue;
     const from = i + 1;
-    if (homeOutRunner && r === homeOutRunner) {
-      grantOuts(1);
-      const plan = baserunPlan(r, from, 4, read);
-      anim.push(plan);
-      front = plan;
+    if (stay && stay[from]) { mins[i] = from; continue; }
+    let min = from;
+    if (wave >= from) min = Math.min(4, wave + 1);
+    mins[i] = min;
+    wave = Math.max(wave, min);
+  }
+  if (stay && stay[3]) {
+    for (let i = 0; i < 2; i++) if (mins[i] > 2) mins[i] = Math.max(i + 1, 2);
+  }
+  const judged = [null, null, null];
+  let ahead = null;
+  for (let i = 2; i >= 0; i--) {
+    if (!slots[i]) continue;
+    const from = i + 1;
+    if (homeOutRunner && slots[i] === homeOutRunner) {
+      const row = chainRunner(slots[i], from, 4, 4, read, who, gx, gy, gr, fld, null);
+      if (!row.outBase) {
+        row.outBase = 4;
+        row.dest = 0;
+        row.plan = planTo(slots[i], from, 4, read, true);
+      }
+      judged[i] = row;
+      ahead = row;
       continue;
     }
-    let dest = Math.min(4, from + n);
-    const nextBag = dest + 1;
-    if (dest < 4 && !taken[nextBag] && wantExtra(from, nextBag, ballX, ballY)) {
-      const hopDur = nextBag === 4 ? homeDur : null;
-      const tryPlan = baserunPlan(r, from, nextBag, read);
-      const tRun = arriveBlocked(tryPlan, (nextBag - from) * JUDGE_BASE_M, front);
-      const tThrow = throwArriveAt(nextBag, x, y, release, fld, hopDur) + tagSlack(r);
-      if (isFinite(tRun) && tRun < tThrow) dest = nextBag;
+    if (stay && stay[from]) {
+      judged[i] = {
+        runner: slots[i], from: from, dest: from, outBase: 0, stop: null,
+        plan: planTo(slots[i], from, from, read, false), tEvent: 0
+      };
+      ahead = null;
+      continue;
     }
-    const plan = baserunPlan(r, from, dest >= 4 ? 4 : dest, read);
-    if (dest >= 4) {
-      runs++;
-      anim.push(plan);
-    } else {
-      taken[dest] = true;
-      next[dest - 1] = r;
-      anim.push(plan);
-    }
-    front = plan;
+    let cap = 4;
+    if (ahead && !ahead.outBase && ahead.dest < 4) cap = Math.max(from, ahead.dest - 1);
+    if (mins[i] > cap) cap = mins[i];
+    const frontPlan = (ahead && (ahead.dest > ahead.from || ahead.outBase)) ? ahead.plan : null;
+    const row = chainRunner(slots[i], from, Math.min(mins[i], cap), cap, read, who, gx, gy, gr, fld, frontPlan);
+    judged[i] = row;
+    ahead = row;
   }
-  if (n < 4) next[n - 1] = batter;
+  const all = [];
+  for (let i = 2; i >= 0; i--) if (judged[i]) all.push(judged[i]);
+  all.push(batterRow);
+  if (opts.committed) all.forEach(function (row) { reachOnMiss(row, read); });
+  function pickPlay(rows) {
+    let out = null;
+    let hold = null;
+    rows.forEach(function (row) {
+      if (!row || !row.stop) return;
+      if (row.outBase) {
+        if (!out || row.outBase > out.outBase) out = row;
+      } else if (row.stop.hold) {
+        if (!hold || row.stop.base > hold.stop.base) hold = row;
+      }
+    });
+    return out || hold || null;
+  }
+  const play = pickPlay(all);
+  if (!opts.committed) {
+    all.forEach(function (row) {
+      if (!row.outBase || !row.stop) return;
+      if (play && play.stop && row.stop.base === play.stop.base) return;
+      reachOnMiss(row, read);
+    });
+  }
+  all.forEach(function (row) {
+    if (row.outBase) row.plan = planTo(row.runner, row.from, row.outBase, read, true);
+  });
+  const events = [];
+  all.forEach(function (row) {
+    if (row.outBase && row.stop) events.push({ t: row.stop.tRun || 0, kind: 'out', row: row });
+    else if (row.dest >= 4) events.push({ t: row.stop ? (row.stop.tRun || 0) : 0, kind: 'score', row: row });
+  });
+  events.sort(function (a, b) { return (a.t - b.t) || (a.kind === 'score' ? -1 : 1); });
+  const hitBases = batterRow.outBase ? Math.max(0, batterRow.outBase - 1) : Math.max(0, Math.min(4, batterRow.dest));
+  if (hitBases >= 1) creditHit(atk, batter, hitBases);
+  else if (batterRow.outBase) touchHeat(batter, 0);
+  let runs = 0;
+  const notes = [];
+  events.forEach(function (ev) {
+    if (game.outs >= 3) return;
+    if (ev.kind === 'out') {
+      grantOuts(1);
+      const j = ev.row.stop;
+      const batterForce = ev.row === batterRow && ev.row.outBase === 1;
+      const forced = !!(j && j.force);
+      const where = ev.row.outBase >= 4 ? '홈' : (ev.row.outBase + '루');
+      if (j && j.assist) {
+        const atkNow = game.isTop ? game.away : game.home;
+        bump(atkNow, 'assist', 1);
+        if (!batterForce && !forced) bump(atkNow, 'to', 1);
+        notes.push('보살 ' + where);
+      } else if (j && !batterForce && !forced) {
+        noteAdvanceOut('cs');
+        notes.push('주루사 ' + where);
+      }
+    } else runs++;
+  });
+  const next = [null, null, null];
+  const bodies = [];
+  for (let i = 2; i >= 0; i--) if (judged[i]) bodies.push(judged[i]);
+  if (hitBases >= 1 && hitBases < 4 && !batterRow.outBase) bodies.push(batterRow);
+  bodies.sort(function (a, b) { return b.dest - a.dest; });
+  bodies.forEach(function (row) {
+    if (row.outBase || row.dest >= 4 || row.dest < 1) return;
+    let d = row.dest;
+    while (d > row.from && next[d - 1]) d--;
+    if (d >= 1 && d <= 3 && !next[d - 1]) {
+      next[d - 1] = row.runner;
+      if (d !== row.dest) {
+        row.dest = d;
+        row.plan = planTo(row.runner, row.from, d, read, false);
+      }
+    }
+  });
   game.bases = next;
   addRuns(atk, def, runs);
+  const anim = [];
+  if (batterRow.plan) anim.push(batterRow.plan);
+  for (let i = 2; i >= 0; i--) if (judged[i] && judged[i].plan) anim.push(judged[i].plan);
   runnersAnim = anim;
-  return runs;
+  const throwRow = play && play.stop ? play : null;
+  return {
+    runs: runs,
+    n: hitBases,
+    batterOut: batterRow.outBase || 0,
+    stretch: !!batterRow.close2,
+    note: notes.join(' · '),
+    homeDrop: !!(pendingHomeDrop && pendingHomeDrop.drop),
+    throwTo: throwRow ? {
+      route: throwRow.stop.route, judge: throwRow.stop, base: throwRow.stop.base,
+      x: gx, y: gy, release: gr, who: who
+    } : null
+  };
 }
 function queueRelayOrBag(who, x, y, release, n, relay) {
   const tossArm = armMetersPerSec(who ? who.fld : 70);
@@ -3319,6 +4331,7 @@ function queueRelayOrBag(who, x, y, release, n, relay) {
 }
 function playBounce(atk, def, batter, shot, fielder, arriveT) {
   let x = shot.targetX, y = shot.targetY, releaseAt = arriveT, who = fielder || activeFielders[0];
+  let throwPrep = 0.32;
   const cantCatchFly = !shot.isGrounder && arriveT > (shot.flightT || shot.T_ball) + 1e-6;
   if (!shot.isGrounder && who) {
     const landT = shot.flightT || shot.T_ball;
@@ -3336,8 +4349,12 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
         shot.animT = landT;
         shot.bounceBack = {
           wallX: carom.wallX, wallY: carom.wallY, tWall: carom.tWall,
-          x: carom.x, y: carom.y, tBack: carom.tBall
+          x: carom.x, y: carom.y, tBack: carom.tBall,
+          v: carom.reboundSpeed, a: carom.decel, dist: carom.reboundDist,
+          incidence: carom.incidence
         };
+        shot.fenceRoute = carom.route || null;
+        shot.fenceNote = '입사각 ' + (carom.incidence * 180 / Math.PI).toFixed(0) + '° · 리바운드 ' + carom.reboundDist.toFixed(1) + 'm';
         shot.hops = true;
         shot.hopH = 1.35;
         shot.targetX = carom.x;
@@ -3347,6 +4364,7 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
         x = carom.x;
         y = carom.y;
         releaseAt = carom.meet;
+        if (carom.recover != null) throwPrep = carom.recover;
       } else {
         const hop = planHop(shot, who);
         if (shot.animLandX == null) {
@@ -3355,15 +4373,31 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
         }
         shot.animT = landT;
         shot.hops = true;
-        shot.hopH = Math.min(2.2, 0.45 + hop.hopDist * 0.035);
-        if (shot.spin === 'back') shot.hopH = Math.min(shot.hopH, 0.55);
-        else if (shot.spin === 'dead') shot.hopH = Math.min(shot.hopH, 0.22);
+        shot.rollV = hop.rollV;
+        shot.rollA = hop.rollA;
+        if (hop.f) who = hop.f;
+        if (hop.hitFence) {
+          shot.bounceBack = {
+            wallX: hop.wallX, wallY: hop.wallY, tWall: hop.tWall,
+            x: hop.x, y: hop.y, tBack: hop.tBall,
+            v: hop.reboundSpeed, a: hop.reboundA, dist: hop.reboundDist,
+            incidence: hop.incidence
+          };
+          shot.fenceRoute = hop.route || null;
+          if (hop.incidence != null) shot.fenceNote = '입사각 ' + (hop.incidence * 180 / Math.PI).toFixed(0) + '° · 리바운드 ' + (hop.reboundDist || 0).toFixed(1) + 'm';
+          shot.hopH = 0.62;
+        } else {
+          shot.hopH = Math.min(1.15, 0.32 + Math.min(hop.hopDist, 10) * 0.03);
+          if (shot.spin === 'back') shot.hopH = Math.min(shot.hopH, 0.48);
+          else if (shot.spin === 'dead') shot.hopH = Math.min(shot.hopH, 0.18);
+        }
         shot.targetX = hop.x;
         shot.targetY = hop.y;
         shot.T_roll = hop.tBall;
         x = hop.x;
         y = hop.y;
         releaseAt = hop.meet;
+        if (hop.hitFence && hop.recover != null) throwPrep = hop.recover;
       }
     }
   } else if (shot.isGrounder && shot.kick) {
@@ -3416,8 +4450,12 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
       }
     }
   }
-  const release = releaseAt + 0.32;
-  const runRead = {
+  const release = releaseAt + throwPrep;
+  if (throwPrep > 0.32 + 1e-9) {
+    shot.gloveAt = releaseAt;
+    shot.fenceRecover = throwPrep;
+  }
+  const settled = settleHit(atk, def, batter, 0, x, y, release, who ? who.fld : 70, null, null, {
     fly: !shot.isGrounder && shot.launchAngle >= 15,
     dropAt: shot.flightT || shot.T_ball,
     twoOut: game.outs >= 2,
@@ -3425,114 +4463,67 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
     ballX: x,
     ballY: y,
     batterDelay: 0,
-    uncatchable: cantCatchFly
-  };
-  let route = relayOrDirect(who, x, y, release, '2B');
-  let n = batterSafeBases(batter.spd, route.x, route.y, route.rel, route.fld, batter, runRead);
-  if (!(n === 1 && game.bases[1])) {
-    const key = n >= 3 ? '3B' : '2B';
-    const next = relayOrDirect(who, x, y, release, key);
-    n = batterSafeBases(batter.spd, next.x, next.y, next.rel, next.fld, batter, runRead);
-    const key2 = n >= 3 ? '3B' : '2B';
-    route = key2 === key ? next : relayOrDirect(who, x, y, release, key2);
-    if (route !== next) n = batterSafeBases(batter.spd, route.x, route.y, route.rel, route.fld, batter, runRead);
-  } else if (who && who.isOF) {
-    const homeRoute = relayOrDirect(who, x, y, release, 'HOME');
-    const nHome = batterSafeBases(batter.spd, homeRoute.x, homeRoute.y, homeRoute.rel, homeRoute.fld, batter, runRead);
-    if (homeRoute.relay && nHome === 1) {
-      route = homeRoute;
-      n = 1;
-    } else if (!homeRoute.relay) {
-      route = { relay: null, baseKey: 'HOME', x: x, y: y, rel: release, fld: who ? who.fld : 70 };
-      n = nHome;
-    }
-  }
-  const relay = route.relay;
-  const judgeX = route.x;
-  const judgeY = route.y;
-  const judgeRel = route.rel;
-  const judgeFld = route.fld;
-  if (game) game._relay = relay ? { cutId: relay.cutId, bagId: relay.bagId, spot: relay.spot, baseKey: route.baseKey } : null;
-  let homeOutRunner = null;
-  let cutoffPlay = null;
-  if (relay && n === 1 && game.bases[1]) {
-    cutoffPlay = judgeCutoffHome(relay, game.bases[1], runRead);
-    if (cutoffPlay.canOut) {
-      homeOutRunner = game.bases[1];
-      let reached = 1;
-      for (let b = 2; b <= 3; b++) {
-        const tRun = (b * JUDGE_BASE_M) / statMetersPerSec(batter.spd);
-        if (tRun <= cutoffPlay.throwHomeT) reached = b;
-        else break;
-      }
-      n = reached;
-    }
-  } else if (n === 1 && who && who.isOF && game.bases[1]) {
-    const runner = game.bases[1];
-    const flight = throwFlight(who, x, y, 0, 0);
-    const throwT = release + flight.dur;
-    const homePlan = baserunPlan(runner, 2, 4, runRead);
-    const runT = arriveMeters(homePlan, 2 * JUDGE_BASE_M);
-    shot.homeFlight = flight;
-    shot.homeDrop = !!(flight.bounce && Math.random() < oneBounceMiss(fielderBy('C')));
-    if (shot.homeDrop) chargeError(def);
-    if (!shot.homeDrop && throwT + tagSlack(runner) <= runT && throwOutAtHome(who, x, y, shot.flightT || shot.T_ball, releaseAt)) homeOutRunner = runner;
-  }
-  if (game) game._homeOut = homeOutRunner;
-  const homeDur = shot.homeDrop ? 99 : (shot.homeFlight ? shot.homeFlight.dur : null);
-  const runs = settleHit(atk, def, batter, n, judgeX, judgeY, judgeRel, judgeFld, homeOutRunner, homeDur, runRead);
+    uncatchable: cantCatchFly,
+    chain: true,
+    who: who,
+    gloveX: x,
+    gloveY: y,
+    gloveRel: release
+  });
   clockRunners(0, 'dyn');
+  const n = settled.n;
   const fell = !shot.isGrounder;
-  let hitName = n >= 4 ? ' 장내 홈런!' : n === 3 ? ' 3루타(3B)!' : n === 2 ? ' 2루타!' : ' 안타!';
-  if (shot.bounceBack) {
-    if (n >= 4) hitName = ' 담장 직격 장내 홈런!';
-    else if (n === 3) hitName = ' 담장 직격 3루타!';
-    else if (n === 2) hitName = ' 담장 직격 2루타!';
-    else hitName = ' 담장 직격 안타!';
-  } else if (shot.cleared && n === 1) hitName = ' 키를 넘기는 안타!';
-  let text = (n >= 2 ? '💥 ' : '⚾ ') + (fell ? '떨어지는 공 · ' : '') + batter.name + hitName + ' (비거리 ' + shot.R.toFixed(0) + 'm · ' + shot.exitSpeedKmh.toFixed(0) + 'km/h)';
-  if (runs > 0) text += ' (' + runs + '타점!)';
-  if (cutoffPlay && cutoffPlay.canOut) text += ' · ' + (relay.cut ? relay.cut.name : '컷오프') + ' 홈 중계 송구, ' + homeOutRunner.name + ' 아웃!';
-  else if (homeOutRunner) text += ' · ' + homeOutRunner.name + ' 홈 쇄도, ' + who.name + ' 보살 아웃!';
-  else if (shot.homeDrop) text += ' · 원바운드 송구가 포수 뒤로 빠졌습니다(E)!';
-  else if (cutoffPlay && n === 1) text += ' · 컷오프, 홈은 세이프라 2루 송구로 추가 진루를 막았습니다';
-  if (cutoffPlay && cutoffPlay.canOut) playCaption = { text: '컷오프 홈 송구!', bad: true };
-  else if (n >= 4) playCaption = { text: '홈런!', bad: false };
-  else if (n === 3) playCaption = { text: shot.bounceBack ? '담장 직격 3루타!' : '3루타!', bad: false };
-  else if (homeOutRunner) playCaption = { text: '홈 보살 아웃!', bad: true };
-  else if (shot.bounceBack && n === 2) playCaption = { text: '담장 직격 2루타!', bad: false };
-  if (cutoffPlay && cutoffPlay.canOut) {
-    queueThrow({
-      from: who.pos, toPos: relay.cutId, x0: x, y0: y, x1: relay.spot.x, y1: relay.spot.y,
-      release: release, dur: relay.flight1, arm: relay.arm1
-    });
-    queueThrow({
-      from: relay.cutId, to: 'HOME', toPos: 'C', x0: relay.spot.x, y0: relay.spot.y,
-      release: relay.rel2, arm: cutoffPlay.arm
-    });
-  } else if (shot.homeDrop && shot.homeFlight) {
+  if (settled.homeDrop && who) {
+    const flight = pendingHomeDrop && pendingHomeDrop.flight;
     queueThrow({
       from: who.pos, to: 'HOME', x0: x, y0: y, x1: 8, y1: -4, wild: true,
-      release: release, dur: shot.homeFlight.dur, arm: shot.homeFlight.arm
+      release: release, dur: flight ? flight.dur : null, arm: flight ? flight.arm : armMetersPerSec(who.fld)
     });
-  } else if (homeOutRunner) {
-    queueThrow({
-      from: who.pos, to: 'HOME', x0: x, y0: y, x1: 0, y1: 0, release: release,
-      dur: shot.homeFlight ? shot.homeFlight.dur : null,
-      arm: shot.homeFlight ? shot.homeFlight.arm : armMetersPerSec(who.fld),
-      bounce: !!(shot.homeFlight && shot.homeFlight.bounce)
-    });
-  } else {
-    queueRelayOrBag(who, x, y, release, n, relay);
-    if (n < 2) armCaption((shot.cleared && n === 1 ? '키를 넘기는 안타! ' : (fell ? '떨어지는 공 · ' : '')) + singleSide(x) + ' 안타!', 'after');
+  } else if (settled.throwTo && who) {
+    queueContestThrow(who, settled.throwTo);
+    const j = settled.throwTo.judge;
+    if (j) noteBaseRace(settled.throwTo.route.baseKey || '2B', j.tRun, j.tLive);
+  } else if (n > 0 && n < 4 && who) {
+    const key = n >= 3 ? '3B' : '2B';
+    const route = relayOrDirect(who, x, y, release, key);
+    if (game) game._relay = route.relay ? { cutId: route.relay.cutId, bagId: route.relay.bagId, spot: route.relay.spot, baseKey: route.baseKey } : null;
+    queueRelayOrBag(who, x, y, release, Math.max(1, n), route.relay);
+    if (n < 2) armCaption((shot.cleared ? '키를 넘기는 안타! ' : (fell ? '떨어지는 공 · ' : '')) + singleSide(x) + ' 안타!', 'after');
   }
+  let text;
+  if (n <= 0) {
+    text = '❌ ' + batter.name + ' 송구에 1루에서 아웃! (비거리 ' + shot.R.toFixed(0) + 'm · ' + shot.exitSpeedKmh.toFixed(0) + 'km/h)';
+    playCaption = { text: '1루 아웃!', bad: true };
+  } else {
+    let hitName = n >= 4 ? ' 장내 홈런!' : n === 3 ? ' 3루타(3B)!' : n === 2 ? ' 2루타!' : ' 안타!';
+    if (shot.bounceBack) {
+      if (n >= 4) hitName = ' 담장 직격 장내 홈런!';
+      else if (n === 3) hitName = ' 담장 직격 3루타!';
+      else if (n === 2) hitName = ' 담장 직격 2루타!';
+      else hitName = ' 담장 직격 안타!';
+    } else if (shot.cleared && n === 1) hitName = ' 키를 넘기는 안타!';
+    text = (n >= 2 ? '💥 ' : '⚾ ') + (fell ? '떨어지는 공 · ' : '') + batter.name + hitName + ' (비거리 ' + shot.R.toFixed(0) + 'm · ' + shot.exitSpeedKmh.toFixed(0) + 'km/h)';
+    if (settled.stretch) {
+      text += ' · 1루 전방 3m에서 2루 승부';
+      playCaption = { text: '2루 승부!', bad: false };
+    } else if (n >= 4) playCaption = { text: '홈런!', bad: false };
+    else if (n === 3) playCaption = { text: shot.bounceBack ? '담장 직격 3루타!' : '3루타!', bad: false };
+    else if (shot.bounceBack && n === 2) playCaption = { text: '담장 직격 2루타!', bad: false };
+    if (settled.runs > 0) text += ' (' + settled.runs + '타점!)';
+  }
+  if (settled.note) {
+    text += ' · ' + settled.note;
+    if (!playCaption || playCaption.text === '2루 승부!') playCaption = { text: settled.note.indexOf('보살') >= 0 ? '보살 아웃!' : '주루사!', bad: true };
+  }
+  if (settled.homeDrop) text += ' · 원바운드 송구가 포수 뒤로 빠졌습니다(E)!';
+  if (shot.fenceNote) text += ' · ' + shot.fenceNote;
   return {
     msg: text, fielder: who,
     formation: n >= 2 ? 'hit' : 'relay2',
     showTail: !shot.isGrounder && (n >= 2 || shot.R >= 55)
   };
 }
-function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
+function resolveContact(atk, def, batter, pit, effCtrl, effStuff) {
   batter.ab++;
   let shot = launchBattedBall(batter, pit, effCtrl, effStuff, false);
   let chase = chaseBall(shot.targetX, shot.targetY, shot.interceptR);
@@ -3546,9 +4537,9 @@ function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
       touchHeat(batter, 0);
       runnersAnim = read.anim;
       playCaption = { text: '파울 플라이 포구!', bad: true };
+      markDeepBall(shot);
       setGoals(chase.bestF.pos, shot.targetX, shot.targetY, 'fly');
       ball = makeBall(shot, true, false);
-      armSlow(shot.targetX, shot.targetY);
       return foulNote + '🧤 파울 플라이 추격 포구! ' + chase.bestF.name + ' 아웃.';
     }
     foulNote = shot.isGrounder ? '3루선·1루선 바깥 땅볼은 파울이 됐고, ' : '파울 쪽 뜬공은 떨어졌고, ';
@@ -3614,7 +4605,6 @@ function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
       shot.targetX = shot.animLandX;
       shot.targetY = shot.animLandY;
       playCaption = { text: '담장 점프 호수비!', bad: true };
-      armSlow(shot.targetX, Math.min(shot.targetY, FENCE_DIST - 1));
       msg += '🧱 ' + bestF.name + ' 담장 점프 호수비! 홈런성 타구를 잡아냈습니다. (' + shot.R.toFixed(0) + 'm)';
       if (read.runs) msg += ' ' + read.runs + '점은 포구 전에 홈을 밟았습니다.';
     } else {
@@ -3624,7 +4614,6 @@ function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
       runnersAnim = res.animList;
       showTail = true;
       formation = 'hit';
-      if (lateClose) armSlow(shot.targetX * 0.7, shot.targetY * 0.7);
       playCaption = { text: '홈런!', bad: false };
       msg += '🎉 ' + batter.name + ' ' + (res.runs === 4 ? '만루' : res.runs + '점') + ' 홈런! (비거리 ' + shot.R.toFixed(0) + 'm · 타구속도 ' + shot.exitSpeedKmh.toFixed(0) + 'km/h)';
     }
@@ -3719,13 +4708,25 @@ function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
       let wild = Math.random() < throwMiss(bestF, batter, pit);
       const bounceDrop = !wild && flight.bounce && Math.random() < oneBounceMiss(fielderBy('C'));
       if (bounceDrop) wild = true;
+      const jTag = wild ? null : judgeContest(tagT, throwT + slack, runner, bestF.fld, { force: false });
+      const tagRelease = release - (!wild && jTag && jTag.cut ? jTag.cut : 0);
       queueThrow({
         from: bestF.pos, to: 'HOME', x0: shot.targetX, y0: shot.targetY, x1: wild ? 8 : 0, y1: wild ? -4 : 0, wild: wild,
-        release: release, dur: flight.dur, arm: flight.arm, bounce: flight.bounce && !wild
+        release: tagRelease, dur: flight.dur, arm: flight.arm, bounce: flight.bounce && !wild
       });
       const others = occupyFlyRead(shot.T_ball, outsNow, { 3: true });
-      const send = wild || tagT < throwT + slack;
-      if (!send) {
+      const send = wild || (jTag && jTag.go && !jTag.out);
+      const tagOut = !wild && jTag && jTag.out;
+      if (tagOut) {
+        grantOuts(2);
+        game.bases[2] = null;
+        touchHeat(batter, 0);
+        noteAdvanceOut(jTag.kind === 'assist' ? 'assist' : 'cs');
+        noteBaseRace('HOME', jTag.tRun, jTag.tLive);
+        playCaption = { text: '태그업 주루사!', bad: true };
+        runnersAnim = [{ startIdx: 3, targetIdx: 4, speed: runMetersPerSec(runner.spd), delay: shot.T_ball, who: runner }].concat(others.anim);
+        msg += '❌ ' + batter.name + ' 뜬공 아웃 (' + bestF.name + ' 포구). ' + runner.name + ' 태그업 승부, 홈에서 아웃.';
+      } else if (!send) {
         grantOuts(1);
         touchHeat(batter, 0);
         runnersAnim = others.anim.concat([{
@@ -3742,7 +4743,7 @@ function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
         addRuns(atk, def, 1);
         if (wild) { chargeError(def); playCaption = { text: bounceDrop ? '원바운드 포구 실책!' : '송구 악송구!', bad: true }; }
         else playCaption = { text: '희생플라이!', bad: false };
-        armSlow(0, 0);
+        if (!wild && jTag) noteBaseRace('HOME', jTag.tRun, jTag.tLive);
         msg += '👏 ' + batter.name + ' 희생플라이! 3루 주자 태그업 홈인 (1타점)' + (bounceDrop ? ' · 원바운드가 포수 뒤로 빠짐(E)' : (wild ? ' · 악송구(E)' : '')) + '!';
         runnersAnim = [{ startIdx: 3, targetIdx: 4, speed: runMetersPerSec(runner.spd), delay: shot.T_ball, who: runner }].concat(others.anim);
       }
@@ -3768,7 +4769,9 @@ function resolveContact(atk, def, batter, pit, effCtrl, effStuff, lateClose) {
     showTail = bounced.showTail;
     formation = bounced.formation;
   }
+  markDeepBall(shot);
   setGoals(bestF.pos, shot.targetX, shot.targetY, formation);
+  if (shot.fenceRoute && bestF && (!shot.fenceRoute.pos || shot.fenceRoute.pos === bestF.pos)) stampFenceRoute(bestF, shot.fenceRoute);
   ball = makeBall(shot, showTail, fumble);
   return msg;
 }
@@ -3784,17 +4787,20 @@ function resolveSelfPivot(atk, def, batter, pit, bestF, shot, hand) {
   const throwT = rel + flight.dur;
   const leadTime = JUDGE_BASE_M / runMetersPerSec(lead.spd);
   const got2 = touchT <= leadTime + 1e-9;
-  const got1 = throwT <= batTime + 1e-9;
+  const jPivot = judgeContest(batTime, throwT, batter, bestF.fld, { force: true });
+  const relOut = rel - (jPivot.cut || 0);
   const mark = bestF.pos === '2B' ? '4-3' : '6-3';
   const note = hand.backhand ? ' · 백핸드 역동작' : '';
   bestF.relayLeg = { at: shot.T_ball, x: 0, y: 38.8 };
   game._selfPivot = bestF.pos;
   game._form = 'dp';
   const wild = Math.random() < throwMiss(bestF, batter, pit);
+  const got1 = !wild && jPivot.out;
   queueThrow({
     from: bestF.pos, to: '1B', x0: 0, y0: 38.8, x1: 19.4, y1: 19.4,
-    release: rel, dur: flight.dur, arm: flight.arm, bounce: flight.bounce && !wild, wild: wild
+    release: wild ? rel : relOut, dur: flight.dur, arm: flight.arm, bounce: flight.bounce && !wild, wild: wild
   });
+  if (!wild) noteBaseRace('1B', jPivot.tRun, jPivot.tLive);
   if (wild) {
     chargeError(def);
     batter.chr = 0;
@@ -3871,12 +4877,15 @@ function resolveSelfPivot(atk, def, batter, pit, bestF, shot, hand) {
     pit: pit,
     ballX: shot.targetX,
     ballY: shot.targetY,
-    twoOut: game.outs >= 2
+    twoOut: game.outs >= 2,
+    lockBatter: 1,
+    who: bestF,
+    committed: true
   });
   clockRunners(batDelay, 'dyn');
   armCaption('내야안타! (1루 세이프)', 'safe1');
   game._form = 'ground';
-  return '🔥 ' + batter.name + ' 내야 안타! ' + bestF.name + '의 2루 터치가 늦었습니다.' + note + (scored > 0 ? ' (' + scored + '타점!)' : '');
+  return '🔥 ' + batter.name + ' 내야 안타! ' + bestF.name + '의 2루 터치가 늦었습니다.' + note + (scored.note ? ' · ' + scored.note : '') + (scored.runs > 0 ? ' (' + scored.runs + '타점!)' : '');
 }
 function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
   const batDelay = batterGroundDelay(batter);
@@ -3890,13 +4899,61 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
     let wild = Math.random() < throwMiss(bestF, batter, pit);
     const bounceDrop = !wild && homeFlight.bounce && Math.random() < oneBounceMiss(fielderBy('C'));
     if (bounceDrop) wild = true;
+    const jHome = wild ? { go: true, out: false, cut: 0, hold: false, tRun: runT, tLive: throwT, kind: 'safe' } : judgeContest(runT, throwT + tagSlack(r3), r3, bestF.fld, { force: false });
+    if (!wild && !jHome.go) {
+      const to1 = throwFlight(bestF, shot.targetX, shot.targetY, 19.4, 19.4, homePrep.armScale);
+      const followRelease = shot.T_ball + homePrep.pad;
+      const followAt = followRelease + to1.dur;
+      const coverLag = bestF.pos === '1B' && to1.dist > 11 ? pitcherCoverArrive() : 0;
+      const decide1 = Math.max(followAt, coverLag);
+      const jBat = judgeContest(batTime1B, decide1, batter, bestF.fld, { force: true, floor: coverLag > 0 ? coverLag : null });
+      const rel1 = followRelease - (jBat.cut || 0);
+      queueThrow({
+        from: bestF.pos, to: '1B', x0: shot.targetX, y0: shot.targetY, x1: 19.4, y1: 19.4,
+        release: rel1, dur: to1.dur, arm: to1.arm, bounce: to1.bounce
+      });
+      noteBaseRace('1B', batTime1B, jBat.tLive);
+      const retreat = {
+        startIdx: 3, targetIdx: 3, speed: runMetersPerSec(r3.spd), delay: 0,
+        leadM: Math.min(3.6, dynamicLead(r3, pit)), who: r3,
+        holdM: 4.2, goAt: Math.min(shot.T_ball, throwT), retreat: true
+      };
+      if (jBat.out) {
+        grantOuts(1);
+        touchHeat(batter, 0);
+        runnersAnim = [retreat, { startIdx: 0, targetIdx: 1, speed: runMetersPerSec(batter.spd), delay: batDelay, who: batter }];
+        game._form = 'home';
+        playCaption = { text: '홈 승부 포기', bad: false };
+        return '⬇ 내야 전진. 3루 주자는 승부를 접고, ' + batter.name + '은 1루 아웃.';
+      }
+      const settled = settleHit(atk, def, batter, 1, shot.targetX, shot.targetY, rel1, bestF.fld, null, null, {
+        batterDelay: batDelay, pit: pit, ballX: shot.targetX, ballY: shot.targetY,
+        twoOut: false, lockBatter: 1, who: bestF, stayAt: { 3: true }, committed: true
+      });
+      clockRunners(batDelay, 'dyn');
+      runnersAnim.forEach(function (a) {
+        if (a.who === r3 || a.startIdx === 3) {
+          a.targetIdx = 3;
+          a.retreat = true;
+          a.holdM = 4.2;
+          a.goAt = Math.min(shot.T_ball, throwT);
+          a.leadM = Math.min(3.6, dynamicLead(r3, pit));
+          a.delay = 0;
+        }
+      });
+      game._form = 'ground';
+      armCaption('내야안타! (1루 세이프)', 'safe1');
+      return '⬇ 3루 주자는 홈에서 멈추고, ' + batter.name + ' 내야 안타.' + (settled.runs ? ' (' + settled.runs + '타점)' : '');
+    }
     if (wild) chargeError(def);
+    const homeRelease = shot.T_ball + homePrep.pad - (wild ? 0 : (jHome.cut || 0));
     queueThrow({
       from: bestF.pos, to: 'HOME', x0: shot.targetX, y0: shot.targetY, x1: wild ? 6 : 0, y1: wild ? -3 : 0, wild: wild,
-      release: shot.T_ball + homePrep.pad, dur: homeFlight.dur, arm: homeFlight.arm, bounce: homeFlight.bounce && !wild
+      release: homeRelease, dur: homeFlight.dur, arm: homeFlight.arm, bounce: homeFlight.bounce && !wild
     });
-    armSlow(0, 0);
-    if (!wild && throwT < runT) {
+    if (!wild) noteBaseRace('HOME', jHome.tRun, jHome.tLive);
+    if (!wild && jHome.out) {
+      noteAdvanceOut(jHome.kind === 'assist' ? 'assist' : 'cs');
       grantOuts(1);
       const r1 = game.bases[0], r2 = game.bases[1];
       let n2 = null, n3 = null;
@@ -3918,7 +4975,10 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
     const followAt = followRelease + to1.dur;
     const coverAt = bestF.pos === '1B' && to1.dist > 11 ? pitcherCoverArrive() : 0;
     const decide1 = Math.max(followAt, coverAt);
-    if (!wild && decide1 <= batTime1B) {
+    const jFollow = wild ? null : judgeContest(batTime1B, decide1, batter, bestF.fld, { force: true, floor: coverAt > 0 ? coverAt : null });
+    const relFollow = followRelease - (jFollow && jFollow.cut ? jFollow.cut : 0);
+    if (jFollow) noteBaseRace('1B', jFollow.tRun, jFollow.tLive);
+    if (jFollow && jFollow.out) {
       grantOuts(1);
       touchHeat(batter, 0);
       game._form = 'home';
@@ -3928,7 +4988,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
       ];
       queueThrow({
         from: bestF.pos, to: '1B', x0: shot.targetX, y0: shot.targetY, x1: 19.4, y1: 19.4,
-        release: followRelease, dur: to1.dur, arm: to1.arm, bounce: to1.bounce
+        release: relFollow, dur: to1.dur, arm: to1.arm, bounce: to1.bounce
       });
       playCaption = { text: '홈 승부 세이프', bad: false };
       return '⬇ 내야 전진! 3루 주자 홈 세이프 득점, ' + batter.name + '은 1루 아웃.';
@@ -3942,7 +5002,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
     game._form = 'ground';
     queueThrow({
       from: bestF.pos, to: '1B', x0: shot.targetX, y0: shot.targetY, x1: 19.4, y1: 19.4,
-      release: followRelease, dur: to1.dur, arm: to1.arm, bounce: to1.bounce && !wild
+      release: relFollow, dur: to1.dur, arm: to1.arm, bounce: to1.bounce && !wild
     });
     if (wild) playCaption = { text: bounceDrop ? '원바운드 포구 실책!' : '송구 악송구!', bad: true };
     else armCaption('내야안타! (1루 세이프)', 'safe1');
@@ -3985,6 +5045,14 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
     }
   }
   const decideTime = cover ? Math.max(throwTime, coverAt) : throwTime;
+  const j1 = judgeContest(batTime1B, decideTime, batter, bestF.fld, {
+    force: true,
+    floor: cover ? coverAt : null
+  });
+  if (j1.cut) {
+    release -= j1.cut;
+    throwTime -= j1.cut;
+  }
   const rawThrow = (shot.T_ball + hand.pad) + flight0.dur;
   const lateCover = cover && coverAt > batTime1B + 1e-9 && rawThrow <= batTime1B + 1e-9;
   function queueFirstOut() {
@@ -3998,6 +5066,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
       x0: shot.targetX, y0: shot.targetY, x1: 19.4, y1: 19.4,
       release: release, dur: flight.dur, arm: flight.arm, bounce: !!flight.bounce && !firstCarry
     });
+    noteBaseRace('1B', batTime1B, j1.tLive);
   }
   const wild = Math.random() < throwMiss(bestF, batter, pit);
   const drop = !wild && flight.bounce && !cover && Math.random() < oneBounceMiss(fielderBy('1B'));
@@ -4016,7 +5085,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
     game._form = 'ground';
     return (drop ? '⚠️ ' + bestF.name + ' 원바운드 송구가 1루 뒤로 빠졌습니다(E)! 타자 2루 진루!' : '⚠️ ' + bestF.name + ' 송구 악송구(E)! 타자 2루 진루!') + note;
   }
-  if (decideTime <= batTime1B + 1e-9) {
+  if (j1.out) {
     const canTurn = !!(game.bases[0] && game.outs < 2 && !game.bases[2] && dpMark[bestF.pos]);
     const leadTime = game.bases[0] ? JUDGE_BASE_M / runMetersPerSec(game.bases[0].spd) : 9;
     if (canTurn) {
@@ -4035,6 +5104,7 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
         playCaption = { text: dpMark[bestF.pos] + ' 병살!', bad: false };
         queueThrow({ from: bestF.pos, to: '2B', toPos: pivot, x0: shot.targetX, y0: shot.targetY, x1: 0, y1: 38.8, release: rel1, dur: toss.dur, arm: toss.arm, bounce: toss.bounce });
         queueThrow({ from: pivot, to: '1B', toPos: bestF.pos === '1B' ? 'P' : null, x0: 0, y0: 38.8, x1: 19.4, y1: 19.4, release: rel1 + toss.dur + 0.22, dur: back.dur, arm: back.arm, bounce: back.bounce });
+        noteBaseRace('1B', batTime1B, turnT);
         runnersAnim = [
           { startIdx: 1, targetIdx: 2, speed: runMetersPerSec(leadRunner.spd), delay: 0 },
           { startIdx: 0, targetIdx: 1, speed: runMetersPerSec(batter.spd), delay: batDelay }
@@ -4089,16 +5159,19 @@ function resolveGround(atk, def, batter, pit, bestF, shot, dpMark) {
     pit: pit,
     ballX: shot.targetX,
     ballY: shot.targetY,
-    twoOut: game.outs >= 2
+    twoOut: game.outs >= 2,
+    lockBatter: 1,
+    who: bestF
   });
   clockRunners(batDelay, 'dyn');
-  queueFirstOut();
+  if (scored.throwTo && scored.throwTo.judge && scored.throwTo.judge.out) queueContestThrow(bestF, scored.throwTo);
+  else queueFirstOut();
   armCaption('내야안타! (1루 세이프)', 'safe1');
   game._form = 'ground';
   let tail = note;
   if (lateCover) tail += ' · 투수 1루 커버가 늦었습니다';
   else if (flight.bounce) tail += ' · 원바운드 송구';
-  return '🔥 ' + batter.name + ' 빠른 발로 내야 안타!' + tail + (scored > 0 ? ' (' + scored + '타점!)' : '');
+  return '🔥 ' + batter.name + ' 빠른 발로 내야 안타!' + tail + (scored.note ? ' · ' + scored.note : '') + (scored.runs > 0 ? ' (' + scored.runs + '타점!)' : '');
 }
 function flushInningChange() {
   if (!game || !game._closeInning) return;
@@ -4194,13 +5267,14 @@ function playAtBat(skipAnim) {
   game._holdOuts = false;
   game._revealed = false;
   game._relay = null;
+  game._deepBall = false;
   game.aura = false;
   game._form = '';
   setupDefenseFielders();
   throwBall = null; throwSeq = []; throwPlan = []; glove = null; captionGate = null; captionHoldUntil = 0;
   runnersAnim = []; ball = null; pitchFx = null;
   game._tag1 = false; game._coverP = false; game._needBag = ''; game._chaser = ''; game._catch = null; game._sac3 = false; game._homeOut = null; game._backstop = false; game._selfPivot = ''; game.rbiBatter = null;
-  view.zoom = 1; view.until = 0;
+  view.zoom = 1; view.target = 1; view.zoomAt = 0; view.zoomOut = -1;
 
   const atkTeam = game.isTop ? game.away : game.home;
   const defTeam = game.isTop ? game.home : game.away;
@@ -4212,6 +5286,7 @@ function playAtBat(skipAnim) {
   const batter = atkTeam.batters[atkTeam.idx];
   const pit = defTeam.pitcher;
   showPaBanner(atkTeam, batter);
+  if (pit) pit._armed = false;
 
   const wild = resolveWildPitch(atkTeam, defTeam);
   if (wild) return finishPlate(atkTeam, batter, false, hook, wild.msg, '', wild.dur, skipAnim);
@@ -4222,31 +5297,9 @@ function playAtBat(skipAnim) {
   game.infieldIn = applyInfieldIn();
   game.outfieldDeep = applyOutfieldDepth(batter);
   game.outfieldIn = applyWalkoffOutfieldIn();
-  const fatiguePenalty = Math.max(0, (70 - pit.stamina) * 0.25);
-  const stm = pit.stm == null ? 70 : pit.stm;
-  const drain = Math.max(0.35, Math.min(2.2, 1.1 * (1 - (stm - 70) * 0.012)));
-  let effSpd = pit.spd - fatiguePenalty;
-  let effCtrl = pit.ctrl - fatiguePenalty;
-  let effStuff = pit.stuff;
-  const mnt = pit.mnt == null ? 70 : pit.mnt;
-  const fastOnFirst = !!(game.bases[0] && game.bases[0].spd >= 70);
   const risp = !!(game.bases[1] || game.bases[2]);
-  let mentalNote = '';
-  if (fastOnFirst && mnt < 70) {
-    effCtrl -= (70 - mnt) * 0.18;
-    mentalNote = ' (주자의식)';
-  }
-  if (risp && mnt > 70) {
-    const clutch = (mnt - 70) * 0.14;
-    effStuff += clutch;
-    effCtrl += clutch;
-    mentalNote += ' (위기관리)';
-  }
+  let mentalNote = pitcherLive(pit).note;
   if (applyPullShift(batter)) mentalNote += ' (당겨치기 시프트)';
-  pit.stamina = Math.max(8, pit.stamina - drain);
-  const seq = sequenceEdge(pit, effSpd, effCtrl);
-  if (seq.show) mentalNote += ' (완급조절)';
-  if (!skipAnim) beginPitch(pit);
   const fam = noteFamiliarity(batter, pit);
   if (fam.look >= 2 && fam.bonus > 0) mentalNote += ' (' + fam.look + '번째 타석)';
   const seeRct = batter.rct + fam.bonus;
@@ -4254,88 +5307,58 @@ function playAtBat(skipAnim) {
   game.aura = (batter.heat || 0) >= 2 || risp;
 
   const bunt = resolveBunt(atkTeam, defTeam, batter, pit);
-  if (bunt) return finishPlate(atkTeam, batter, true, hook, bunt.msg, mentalNote, bunt.dur, skipAnim);
+  if (bunt) {
+    if (!(pit._pitchKind && pit._pitchFlight > 0)) armDeliveredPitch(pit, pitcherLive(pit).spd);
+    pit._armed = false;
+    spendPitch(pit);
+    if (!skipAnim) beginPitch(pit);
+    return finishPlate(atkTeam, batter, true, hook, bunt.msg, mentalNote, bunt.dur, skipAnim);
+  }
 
-  const launch = batter.launch != null ? batter.launch : 12;
-  const frame = catcherFrameBonus();
-  const bbRate = Math.max(0.02, Math.min(0.28, 0.095 + (seeRct - 70) * 0.00105 + (batter.pow - 70) * 0.0005 - (launch - 12) * 0.0012 - (effCtrl - 70) * 0.00105 - (effSpd - 70) * 0.0005 - frame));
-  let kRate = Math.max(0.06, Math.min(0.48, 0.19 + (launch - 12) * 0.0045 - (seeRct - 70) * 0.00115 - (seeCon - 70) * 0.00095 + (effSpd - 70) * 0.00115 + (pit.brk - 70) * 0.00095 + frame));
-  if (seq.kAdd) kRate = Math.min(0.5, kRate + seq.kAdd);
-  const lateClose = game.inning >= 8 && Math.abs(atkTeam.score - defTeam.score) <= 2 && risp;
-  let hbpP = 0;
-  if (effCtrl < 72 && batter.rct < 72) hbpP = 0.005 + Math.min(0.005, ((72 - effCtrl) + (72 - batter.rct)) * 0.00012);
-  if (Math.random() < hbpP) {
+  const pa = resolveLiveCount(batter, pit, seeRct, seeCon);
+  if (pa.showSeq) mentalNote += ' (완급조절)';
+  if (!skipAnim) beginPitch(pit, pa.flight);
+  let msg = '';
+  if (pa.outcome === 'hbp') {
     const res = advanceRunners(1, batter, true);
     addRuns(atkTeam, defTeam, res.runs);
     runnersAnim = res.animList;
     bump(atkTeam, 'hbp', 1);
     batter.chr = 0;
     playCaption = { text: '몸에 맞는 볼!', bad: false };
-    if (lateClose) armSlow(0, 1);
-    const msg = '💢 몸에 맞는 볼! ' + batter.name + ' 사구 출루.' + (res.runs ? ' (밀어내기 ' + res.runs + '득점!)' : '');
-    return finishPlate(atkTeam, batter, true, hook, msg, mentalNote, 0.9, skipAnim);
-  }
-
-  const roll = Math.random();
-  let outcome = 'bip';
-  let checkCall = '';
-  if (roll < bbRate) outcome = 'bb';
-  else if (roll < bbRate + kRate) outcome = 'k';
-  const eye = seeRct - (pit.brk || 70);
-  if (outcome === 'k' && eye >= 12 && Math.random() < Math.min(0.22, (eye - 12) * 0.008)) {
-    outcome = 'bb';
-    checkCall = '볼';
-  } else if (outcome === 'bip' && eye <= -12 && Math.random() < Math.min(0.18, (-eye - 12) * 0.006)) {
-    outcome = 'k';
-    checkCall = '헛스윙';
-  } else if (outcome === 'k' && Math.random() < 0.18 + Math.max(0, 64 - seeRct) * 0.004) {
-    checkCall = '헛스윙';
-  } else if (outcome === 'bb' && Math.random() < 0.16 + Math.max(0, seeRct - 66) * 0.004) {
-    checkCall = '볼';
-  }
-  if (lateClose && (outcome === 'k' || outcome === 'bb')) armSlow(0, 1);
-
-  let msg = '';
-  let lead = '';
-  if (outcome === 'bb') {
-    const count = virtualCount('bb');
-    lead = countLead(count, chargeCount(pit, count, 'bb'), 'bb');
+    msg = '💢 몸에 맞는 볼! ' + batter.name + ' 사구 출루.' + (res.runs ? ' (밀어내기 ' + res.runs + '득점!)' : '');
+  } else if (pa.outcome === 'bb') {
     const res = advanceRunners(1, batter, true);
     addRuns(atkTeam, defTeam, res.runs);
     runnersAnim = res.animList;
     bump(atkTeam, 'bb', 1);
     batter.chr = 0;
-    if (checkCall) playCaption = { text: '체크스윙 볼!', bad: false };
-    msg = (checkCall ? '👁️ 체크스윙! 순발력으로 참아 볼 판정. ' : '🚶 ') + batter.name + ' 볼넷 출루!' + (res.runs > 0 ? ' (밀어내기 ' + res.runs + '득점!)' : '');
-  } else if (outcome === 'k') {
-    const count = virtualCount('k');
-    lead = countLead(count, chargeCount(pit, count, 'k'), 'k');
-    const drop = resolveDroppedThird(batter, pit, atkTeam, defTeam, checkCall);
+    playCaption = { text: '볼넷!', bad: false };
+    msg = '🚶 ' + batter.name + ' 볼넷 출루!' + (res.runs > 0 ? ' (밀어내기 ' + res.runs + '득점!)' : '');
+  } else if (pa.outcome === 'k') {
+    const drop = resolveDroppedThird(batter, pit, atkTeam, defTeam, pa.checkCall);
     if (drop) msg = drop.msg;
     else {
       batter.ab++;
       grantOuts(1);
       bump(atkTeam, 'k', 1);
       touchHeat(batter, 0);
-      playCaption = { text: checkCall === '헛스윙' ? '체크스윙 헛스윙!' : '삼진 아웃!', bad: true };
-      msg = checkCall === '헛스윙' ? '💨 체크스윙 헛스윙 삼진! ' + batter.name + ' 아웃.' : '💨 ' + batter.name + ' 헛스윙 삼진 아웃!';
+      if (pa.checkCall === '체크스윙') {
+        playCaption = { text: '체크스윙 헛스윙!', bad: true };
+        msg = '💨 체크스윙 헛스윙 삼진! ' + batter.name + ' 아웃.';
+      } else if (pa.checkCall === '헛스윙') {
+        playCaption = { text: '헛스윙 삼진!', bad: true };
+        msg = '💨 ' + batter.name + ' 헛스윙 삼진 아웃!';
+      } else {
+        playCaption = { text: '루킹 삼진!', bad: true };
+        msg = '💨 ' + batter.name + ' 루킹 삼진 아웃!';
+      }
     }
   } else {
-    const count = virtualCount('bip');
-    lead = countLead(count, chargeCount(pit, count, 'bip'), 'bip');
-    batter._pa = {
-      con: seeCon,
-      rct: seeRct,
-      pow: batter.pow + (count.hitter ? 1.1 : 0) - (count.pitcher ? 0.55 : 0),
-      effSpd: effSpd,
-      seqKick: seq.kick,
-      countHitter: !!count.hitter,
-      countPitcher: !!count.pitcher
-    };
-    if (lateClose && Math.random() < 0.45) armSlow(0, 8);
-    msg = resolveContact(atkTeam, defTeam, batter, pit, effCtrl, effStuff, lateClose);
+    batter._pa = pa.contact;
+    msg = resolveContact(atkTeam, defTeam, batter, pit, pa.effCtrl, pa.effStuff);
   }
-  finishPlate(atkTeam, batter, true, hook, lead + msg, mentalNote, 0.9, skipAnim);
+  finishPlate(atkTeam, batter, true, hook, pa.lead + msg, mentalNote, 0.9, skipAnim);
 }
 
 document.getElementById('btnNext').onclick = function() { playAtBat(false); };
