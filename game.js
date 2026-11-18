@@ -33,6 +33,9 @@
  *      수비수는 startDelay 까지 기다린 뒤 moveSpeed 로 달려 arriveTime 에 닿는다.
  *      주자는 땅볼 스타트 0.45-(rct-70)*0.0025초(능력치 70에서 0.45초)·기습번트 0.32초·낫아웃 0.25초·선행주자 리드 이후
  *      runMetersPerSec 로 움직여 batTime1B·leadTime·canBeatThrow 시각에 베이스에 선다.
+ *      땅볼 1루는 그 정지 출발 평균 속도 그대로다. 홈에서 2루 이상으로 이어 뛸 때는 60ft(18.29m)에서
+ *      최고속(spd 70 = 7.6m/s)에 오른 뒤, 1루를 통과한 구간은 베이스당 라운딩 2.0m를 그 속도로 달린다.
+ *      도루는 리드 3.3m에서 순발 반응(rct 70 = 0.18초)과 정지 가속 손실 뒤에 그 최고속으로 뛴다.
  *      2아웃 전력 스타트, 0·1아웃 뜬공 하프웨이, 비포스 진루, 동적 리드(4.2~6.2m), 라운딩, 1루 오버런,
  *      추월 금지, 태그(+0.12초)·슬라이딩(−0.08초)도 이 시계의 m/s·초로만 계산한다.
  *      송구는 포구 후 0.32~0.42초 준비 뒤 armMetersPerSec 로 날아가
@@ -751,6 +754,13 @@ function statMetersPerSec(spd) {
   return Math.max(3.4, (Number(spd) || 70) / 90 * (100 / 12));
 }
 function runMetersPerSec(spd) { return statMetersPerSec(spd); }
+const TOP_RUN_AT_70 = 7.6;
+const ROUND_STEP_M = 2.0;
+const ACCEL_WINDOW_M = 18.29;
+function topRunMetersPerSec(spd) {
+  const ref = statMetersPerSec(70);
+  return statMetersPerSec(spd) * (TOP_RUN_AT_70 / ref);
+}
 function armMetersPerSec(fld) { return 18.5 + (Number(fld) || 70) * 0.108; }
 function startDelay(f) {
   const rct = Number(f && f.rct) || 70;
@@ -1069,17 +1079,24 @@ function catcherPopTime(c) {
   return 2.18 + (f - 50) * ((1.98 - 2.18) / 20);
 }
 const STEAL_TRANSFER = 0.36;
+const STEAL_LEAD_M = 3.3;
+const STEAL_ACCEL_LOSS = 0.25;
+// 옆을 보고 선 리드에서 2루 쪽으로 첫 발을 빼는 시간. 직선 가속 손실 0.25초와 더한다.
+const STEAL_CROSS_STEP = 0.08;
+function stealReact(rct) {
+  const raw = Number(rct);
+  const r = isNaN(raw) ? 70 : raw;
+  return 0.26 - (r - 50) * 0.004;
+}
 function stealBreakLead(runner, pit) {
   const spd = runner ? (Number(runner.spd) || 70) : 70;
   const rct = runner ? (Number(runner.rct) || 70) : 70;
   const brk = pit ? (Number(pit.brk) || 70) : 70;
   const mnt = pit ? (Number(pit.mnt) || 70) : 70;
-  // spd 70 is 6.48m/s, so a 3.45s break from the lead to 2B starts about 5.07m off the bag.
-  const anchor = JUDGE_BASE_M - 3.45 * statMetersPerSec(70);
-  let lead = anchor + (spd - 70) * 0.016 + (rct - 70) * 0.01 - ((brk + mnt) / 2 - 70) * 0.012;
+  let lead = STEAL_LEAD_M + (spd - 70) * 0.016 + (rct - 70) * 0.01 - ((brk + mnt) / 2 - 70) * 0.012;
   if (runner && runner._leadCut) lead -= runner._leadCut;
-  if (lead < 3.2) lead = 3.2;
-  if (lead > 6.2) lead = 6.2;
+  if (lead < 2.2) lead = 2.2;
+  if (lead > 4.8) lead = 4.8;
   return lead;
 }
 function stealTimeline(pit, c, runner) {
@@ -1090,11 +1107,14 @@ function stealTimeline(pit, c, runner) {
   const release = receive + STEAL_TRANSFER;
   const arrive = receive + pop;
   const lead = stealBreakLead(runner, pit);
-  const speed = runMetersPerSec(runner ? runner.spd : 70);
-  const runT = (JUDGE_BASE_M - lead) / Math.max(0.1, speed);
+  const speed = topRunMetersPerSec(runner ? runner.spd : 70);
+  const react = stealReact(runner ? runner.rct : 70);
+  const delay = react + STEAL_ACCEL_LOSS + STEAL_CROSS_STEP;
+  const runT = delay + (JUDGE_BASE_M - lead) / Math.max(0.1, speed);
   return {
     quick: quick, flight: flight, pop: pop, receive: receive, release: release, arrive: arrive,
-    lead: lead, speed: speed, runT: runT, throwDur: Math.max(0.2, pop - STEAL_TRANSFER)
+    lead: lead, speed: speed, react: react, accel: STEAL_ACCEL_LOSS, cross: STEAL_CROSS_STEP,
+    delay: delay, runT: runT, throwDur: Math.max(0.2, pop - STEAL_TRANSFER)
   };
 }
 function armStealPitch(pit, quick, flight) {
@@ -1222,6 +1242,14 @@ function relayPair(x, chaser) {
   if (cut === chaser) { const swap = cut; cut = bag; bag = swap; }
   return { cut: cut, bag: bag };
 }
+function relayExchange(fld) {
+  const raw = Number(fld);
+  const f = isNaN(raw) ? 70 : raw;
+  const t = 0.55 - (f - 70) * 0.0065;
+  if (t < 0.36) return 0.36;
+  if (t > 0.85) return 0.85;
+  return t;
+}
 function planRelay(who, x, y, release, baseKey) {
   const pair = relayPair(x, who ? who.pos : '');
   const cut = fielderBy(pair.cut) || who;
@@ -1229,8 +1257,9 @@ function planRelay(who, x, y, release, baseKey) {
   const arm1 = armMetersPerSec(who ? who.fld : 70);
   const flight1 = Math.max(0.08, Math.hypot(spot.x - x, spot.y - y) / arm1);
   const cutRun = cut ? arriveTime(cut, spot.x, spot.y) : release + flight1;
-  const rel2 = Math.max(release + flight1, cutRun) + 0.22;
-  return { cut: cut, cutId: pair.cut, bagId: pair.bag, spot: spot, arm1: arm1, flight1: flight1, rel2: rel2 };
+  const exchange = relayExchange(cut ? cut.fld : 70);
+  const rel2 = Math.max(release + flight1, cutRun) + exchange;
+  return { cut: cut, cutId: pair.cut, bagId: pair.bag, spot: spot, arm1: arm1, flight1: flight1, exchange: exchange, rel2: rel2 };
 }
 function directThrowTime(who, x, y, release, base) {
   const arm = armMetersPerSec(who ? who.fld : 70);
@@ -1271,6 +1300,14 @@ function judgeCutoffHome(relay, runner, read) {
 function cushionRead(fld) {
   const skill = Number(fld) || 70;
   return Math.max(0.06, 0.28 - (skill - 70) * 0.0065);
+}
+function fenceRecover(fld) {
+  const raw = Number(fld);
+  const f = isNaN(raw) ? 70 : raw;
+  const t = 1.4 - (f - 50) * 0.005;
+  if (t < 1.05) return 1.05;
+  if (t > 1.55) return 1.55;
+  return t;
 }
 function planFenceCarom(shot, hint) {
   if (!shot || shot.isGrounder) return null;
@@ -1313,7 +1350,8 @@ function planFenceCarom(shot, hint) {
   chosen.wallY = wallY;
   chosen.tWall = tWall;
   chosen.read = read;
-  chosen.meet = Math.max(chosen.tBall, chosen.tField) + read;
+  chosen.recover = fenceRecover(f ? f.fld : 70);
+  chosen.meet = Math.max(chosen.tBall, chosen.tField);
   return chosen;
 }
 function groundBallZ(shot, r) {
@@ -1540,6 +1578,7 @@ function planHop(shot, f) {
     const near = chaseBall(wallX, wallY, FENCE_DIST, { onlyOF: true });
     const rf = (near && near.bestF) || f;
     const read = cushionRead(rf ? rf.fld : 70);
+    const recover = fenceRecover(rf ? rf.fld : 70);
     const maxBack = Math.min(14, 5 + reboundV * 0.65);
     let chosen = null;
     for (let i = 0; i <= 12; i++) {
@@ -1558,9 +1597,9 @@ function planHop(shot, f) {
     }
     return {
       x: chosen.x, y: chosen.y, tBall: chosen.tBall, tField: chosen.tField,
-      meet: Math.max(chosen.tBall, chosen.tField) + read,
+      meet: Math.max(chosen.tBall, chosen.tField),
       hopDist: fenceGap, rollV: vB, rollA: decel, hitFence: true, f: rf,
-      wallX: wallX, wallY: wallY, tWall: tWall, read: read
+      wallX: wallX, wallY: wallY, tWall: tWall, read: read, recover: recover
     };
   }
   if (!meet) {
@@ -2593,8 +2632,62 @@ function baserunPlan(runner, from, to, read) {
     plan.holdM = HALFWAY_M;
     plan.goAt = read.dropAt;
   }
-  if (to - from >= 2) plan.roundM = ROUND_BULGE;
+  if (to - from >= 2) {
+    plan.roundM = ROUND_BULGE;
+    plan.topSpeed = topRunMetersPerSec(runner ? runner.spd : 70);
+  }
   return plan;
+}
+function multiCruise(plan) {
+  if (!plan || plan.retreat || !(plan.topSpeed > 0)) return false;
+  if ((plan.targetIdx - plan.startIdx) < 2) return false;
+  if (plan.holdM != null && plan.goAt != null) return false;
+  return true;
+}
+function cruisePathSpeed(top) {
+  const v1 = top > 1e-4 ? top : 1e-4;
+  return v1 * JUDGE_BASE_M / (JUDGE_BASE_M + ROUND_STEP_M);
+}
+function timeAlong(plan, meters) {
+  const v0 = plan.speed > 1e-4 ? plan.speed : 1e-4;
+  const v1 = plan.topSpeed > 1e-4 ? plan.topSpeed : v0;
+  const delay = plan.delay || 0;
+  const lead = Math.max(0, plan.leadM || 0);
+  const bag = JUDGE_BASE_M;
+  const fromBox = plan.startIdx === 0 && lead < 0.4;
+  const vEff = cruisePathSpeed(v1);
+  if (fromBox) {
+    const accelEnd = Math.min(bag, ACCEL_WINDOW_M);
+    if (meters <= accelEnd) return delay + meters / v0;
+    const tAccel = delay + accelEnd / v0;
+    if (meters <= bag) return tAccel + (meters - accelEnd) / v1;
+    const tBag = tAccel + (bag - accelEnd) / v1;
+    return tBag + (meters - bag) / vEff;
+  }
+  if (meters <= bag) return delay + Math.max(0, meters - lead) / v0;
+  const tBag = delay + Math.max(0, bag - lead) / v0;
+  return tBag + (meters - bag) / vEff;
+}
+function metersAlong(plan, t) {
+  const v0 = plan.speed > 1e-4 ? plan.speed : 1e-4;
+  const v1 = plan.topSpeed > 1e-4 ? plan.topSpeed : v0;
+  const delay = plan.delay || 0;
+  const lead = Math.max(0, plan.leadM || 0);
+  if (t <= delay) return lead;
+  const bag = JUDGE_BASE_M;
+  const fromBox = plan.startIdx === 0 && lead < 0.4;
+  const vEff = cruisePathSpeed(v1);
+  if (fromBox) {
+    const accelEnd = Math.min(bag, ACCEL_WINDOW_M);
+    const tAccel = delay + accelEnd / v0;
+    if (t <= tAccel) return v0 * (t - delay);
+    const tBag = tAccel + (bag - accelEnd) / v1;
+    if (t <= tBag) return accelEnd + v1 * (t - tAccel);
+    return bag + vEff * (t - tBag);
+  }
+  const tBag = delay + Math.max(0, bag - lead) / v0;
+  if (t <= tBag) return lead + v0 * (t - delay);
+  return bag + vEff * (t - tBag);
 }
 function travelCap(plan) {
   if (!plan) return 0;
@@ -2617,7 +2710,7 @@ function arriveMeters(plan, meters) {
     if (goAt <= tHold) return delay + (meters - lead) / spd;
     return goAt + (meters - hold) / spd;
   }
-  const t = delay + (meters - lead) / spd;
+  const t = multiCruise(plan) ? timeAlong(plan, meters) : delay + (meters - lead) / spd;
   if (plan.freezeAt != null && t > plan.freezeAt + 1e-6) return Infinity;
   return t;
 }
@@ -2656,6 +2749,7 @@ function forwardMeters(r, t) {
       if (t <= delay) return lead;
       return Math.max(0, lead - spd * (t - delay));
     }
+    if (multiCruise(r)) return metersAlong(r, t);
     return t <= delay ? lead : lead + spd * (t - delay);
   }
   const tHold = delay + Math.max(0, hold - lead) / spd;
@@ -3264,7 +3358,7 @@ function resolveFirstThirdSteal(atk, def, r1, r3, pit) {
       release: liveRelay, dur: relayDur, arm: pArm
     });
     runnersAnim = [
-      { startIdx: 1, targetIdx: 2, speed: tl.speed, delay: 0, leadM: tl.lead, who: r1 },
+      { startIdx: 1, targetIdx: 2, speed: tl.speed, delay: tl.delay, leadM: tl.lead, who: r1 },
       { startIdx: 3, targetIdx: 3, speed: runMetersPerSec(r3.spd), delay: 0, leadM: lead3, who: r3, holdM: Math.min(5.5, HALFWAY_M), goAt: cutT, retreat: true }
     ];
     noteBaseRace('2B', jCut.tRun, jCut.tLive);
@@ -3292,7 +3386,7 @@ function resolveFirstThirdSteal(atk, def, r1, r3, pit) {
     release: stealRelease, dur: tl.throwDur, arm: cArm
   });
   runnersAnim = [
-    { startIdx: 1, targetIdx: 2, speed: tl.speed, delay: 0, leadM: tl.lead, who: r1 },
+    { startIdx: 1, targetIdx: 2, speed: tl.speed, delay: tl.delay, leadM: tl.lead, who: r1 },
     { startIdx: 3, targetIdx: 4, speed: runMetersPerSec(r3.spd), delay: homeDelay, leadM: lead3, who: r3 }
   ];
   noteBaseRace('2B', jSteal.tRun, jSteal.tLive);
@@ -3350,7 +3444,7 @@ function resolveSidePlay(atk, def) {
     const release = tl.release - (j.cut || 0);
     armStealPitch(pit, tl.quick, tl.flight);
     setGoals(null, 0, 38.8, 'steal');
-    runnersAnim = [{ startIdx: 1, targetIdx: 2, speed: tl.speed, delay: 0, leadM: tl.lead, who: r1 }];
+    runnersAnim = [{ startIdx: 1, targetIdx: 2, speed: tl.speed, delay: tl.delay, leadM: tl.lead, who: r1 }];
     queueThrow({
       from: 'C', to: '2B', toPos: '2B', x0: 0, y0: -1.5, x1: 0, y1: 38.8, wild: false, needsCatch: false,
       release: release, dur: tl.throwDur, arm: cArm
@@ -3887,6 +3981,7 @@ function queueRelayOrBag(who, x, y, release, n, relay) {
 }
 function playBounce(atk, def, batter, shot, fielder, arriveT) {
   let x = shot.targetX, y = shot.targetY, releaseAt = arriveT, who = fielder || activeFielders[0];
+  let throwPrep = 0.32;
   const cantCatchFly = !shot.isGrounder && arriveT > (shot.flightT || shot.T_ball) + 1e-6;
   if (!shot.isGrounder && who) {
     const landT = shot.flightT || shot.T_ball;
@@ -3915,6 +4010,7 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
         x = carom.x;
         y = carom.y;
         releaseAt = carom.meet;
+        if (carom.recover != null) throwPrep = carom.recover;
       } else {
         const hop = planHop(shot, who);
         if (shot.animLandX == null) {
@@ -3943,6 +4039,7 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
         x = hop.x;
         y = hop.y;
         releaseAt = hop.meet;
+        if (hop.hitFence && hop.recover != null) throwPrep = hop.recover;
       }
     }
   } else if (shot.isGrounder && shot.kick) {
@@ -3995,7 +4092,11 @@ function playBounce(atk, def, batter, shot, fielder, arriveT) {
       }
     }
   }
-  const release = releaseAt + 0.32;
+  const release = releaseAt + throwPrep;
+  if (throwPrep > 0.32 + 1e-9) {
+    shot.gloveAt = releaseAt;
+    shot.fenceRecover = throwPrep;
+  }
   const settled = settleHit(atk, def, batter, 0, x, y, release, who ? who.fld : 70, null, null, {
     fly: !shot.isGrounder && shot.launchAngle >= 15,
     dropAt: shot.flightT || shot.T_ball,
